@@ -4,7 +4,7 @@ Generate websites from videos using Google Gemini AI.
 
 ## Setup
 
-### API Key Configuration
+### 1. API Key Configuration
 
 1. Get your Google Gemini API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
 2. Open `config.js` in the Codify directory
@@ -13,7 +13,23 @@ Generate websites from videos using Google Gemini AI.
    const GEMINI_API_KEY_CONFIG = "your_actual_api_key_here";
    ```
 4. Save the file
-5. Load the extension in Chrome
+
+### 2. Start Local Server
+
+The extension uses a local server to display generated websites. Start the server:
+
+```bash
+node server.js
+```
+
+Keep this server running while using the extension. The server runs on `http://localhost:8765`.
+
+### 3. Load Extension
+
+1. Open Chrome and go to `chrome://extensions/`
+2. Enable "Developer mode"
+3. Click "Load unpacked"
+4. Select the Codify directory
 
 **Note**: `config.js` contains a placeholder API key. You must update it with your own key before using the extension.
 

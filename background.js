@@ -91,23 +91,32 @@ async function processVideoWithGemini(frames, apiKey, iteration, previousCode) {
 function buildPrompt(frames, iteration, previousCode) {
   let prompt = `You are a web developer AI. Analyze the provided video frames and generate a complete website that matches what is shown in the video.
 
-IMPORTANT: Focus on:
-1. The layout and structure of the website (header, navigation, content areas, footer)
-2. Navigation elements (buttons, links, menus) and where they lead when clicked
-3. Visual styling (colors, fonts, spacing, borders, shadows, gradients)
-4. Interactive elements and their behavior (hover effects, click animations)
-5. Text content visible in the frames
-6. Images, icons, and visual elements
+CRITICAL REQUIREMENTS - Pay EXTREMELY close attention to:
+1. FONT FAMILY: Identify the exact font family used (e.g., Arial, Helvetica, Roboto, Inter, Georgia, Times New Roman, etc.). Use the EXACT same font family in your CSS. If you cannot identify it, use a very similar system font.
+2. FONT SIZES: Measure and match font sizes EXACTLY. Use pixel values (px) and ensure headings, body text, buttons, and all text elements match the video frames precisely. Pay attention to:
+   - Headings (h1, h2, h3) sizes
+   - Body text size
+   - Button text size
+   - Navigation text size
+   - Any other text elements
+3. FONT WEIGHT: Match font weights exactly (normal, bold, 300, 400, 500, 600, 700, etc.)
+4. LINE HEIGHT: Match line spacing and line heights
+5. The layout and structure of the website (header, navigation, content areas, footer)
+6. Navigation elements (buttons, links, menus) and where they lead when clicked
+7. Visual styling (colors, spacing, borders, shadows, gradients, padding, margins)
+8. Interactive elements and their behavior (hover effects, click animations, transitions)
+9. Text content visible in the frames
+10. Images, icons, and visual elements
 
-${iteration > 0 ? `This is iteration ${iteration + 1}. The previous code had some issues or didn't match the video closely enough. Please refine it to better match the video frames.` : ''}
+${iteration > 0 ? `This is iteration ${iteration + 1}. The previous code had some issues or didn't match the video closely enough. Please refine it to better match the video frames, especially font sizes and font families.` : ''}
 
-${previousCode ? `Previous code:\nHTML: ${previousCode.html.substring(0, 500)}...\nCSS: ${previousCode.css.substring(0, 500)}...\nJS: ${previousCode.js.substring(0, 500)}...\n\nPlease improve upon this code to better match the video.` : ''}
+${previousCode ? `Previous code:\nHTML: ${previousCode.html.substring(0, 500)}...\nCSS: ${previousCode.css.substring(0, 500)}...\nJS: ${previousCode.js.substring(0, 500)}...\n\nPlease improve upon this code to better match the video, with special attention to fonts and font sizes.` : ''}
 
 Generate the website code as a JSON object with the following structure:
 {
   "html": "<!DOCTYPE html><html>...complete HTML with all structure...</html>",
-  "css": "/* Complete CSS with all styling */",
-  "js": "// Complete JavaScript with all interactions"
+  "css": "/* Complete CSS with all styling - MUST include exact font-family and font-size for all elements */",
+  "js": "// Complete JavaScript with all interactions - ensure all interactive elements work correctly"
 }
 
 Requirements:
@@ -115,8 +124,11 @@ Requirements:
 - Include all CSS in a <style> tag or the css field (we'll inject it)
 - Include all JavaScript in a <script> tag or the js field (we'll inject it)
 - Make sure navigation works (use hash routing or show/hide sections)
-- Match colors, fonts, and layout as closely as possible
+- Match colors, fonts, font sizes, and layout as closely as possible
 - Include all interactive elements (buttons, links, forms, etc.)
+- Ensure JavaScript is correct and functional - test logic in your mind before outputting
+- Use proper event listeners and DOM manipulation
+- Ensure all click handlers, hover effects, and interactions work as shown in the video
 
 Output ONLY valid JSON, no markdown code blocks, no explanations, just the JSON object.`;
 

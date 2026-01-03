@@ -2,8 +2,7 @@
 .env
 
 # API key configuration (users should add their own key)
-# Note: config.js is committed with placeholder - users must update it
-# config.js
+config.js
 
 # Icons (optional, user-generated)
 icons/*.png
