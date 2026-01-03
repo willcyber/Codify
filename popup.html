@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codify</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Codify</h1>
+    <p class="subtitle">Generate websites from videos</p>
+
+    <div class="upload-section">
+      <input type="file" id="videoInput" accept="video/*" style="display: none;">
+      <button id="uploadBtn" class="upload-btn">Choose Video</button>
+      <div id="videoInfo" class="video-info" style="display: none;">
+        <p id="fileName"></p>
+        <button id="processBtn" class="process-btn">Process Video</button>
+      </div>
+    </div>
+
+    <div id="status" class="status" style="display: none;">
+      <div class="spinner"></div>
+      <p id="statusText"></p>
+    </div>
+
+    <div id="progress" class="progress" style="display: none;">
+      <div class="progress-bar">
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
+      <p id="progressText">Processing...</p>
+    </div>
+
+    <div id="results" class="results" style="display: none;">
+      <p id="resultText"></p>
+      <button id="continueBtn" class="continue-btn">Continue Refining</button>
+    </div>
+  </div>
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
+

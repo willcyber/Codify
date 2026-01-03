@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# API key configuration (users should add their own key)
+# Note: config.js is committed with placeholder - users must update it
+# config.js
+
+# Icons (optional, user-generated)
+icons/*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+
+
