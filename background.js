@@ -31,16 +31,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
     
-    processVideoWithGemini(request.frames, apiKey, request.iteration, request.previousCode)
+    processVideoWithGemini(request.frames, apiKey, request.iteration, request.previousCode, request.previousScreenshot)
       .then(result => sendResponse(result))
       .catch(error => sendResponse({ error: error.message }));
     return true;
   }
 });
 
-async function processVideoWithGemini(frames, apiKey, iteration, previousCode) {
+async function processVideoWithGemini(frames, apiKey, iteration, previousCode, previousScreenshot) {
   try {
-    const prompt = buildPrompt(frames, iteration, previousCode);
+    const prompt = buildPrompt(frames, iteration, previousCode, previousScreenshot);
     
     const imageParts = frames.map(frame => ({
       inline_data: {
@@ -48,6 +48,15 @@ async function processVideoWithGemini(frames, apiKey, iteration, previousCode) {
         data: frame.image.split(',')[1]
       }
     }));
+    
+    if (previousScreenshot && iteration > 0) {
+      imageParts.push({
+        inline_data: {
+          mime_type: "image/png",
+          data: previousScreenshot.split(',')[1]
+        }
+      });
+    }
     
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent?key=${apiKey}`;
     
@@ -88,8 +97,15 @@ async function processVideoWithGemini(frames, apiKey, iteration, previousCode) {
   }
 }
 
-function buildPrompt(frames, iteration, previousCode) {
+function buildPrompt(frames, iteration, previousCode, previousScreenshot) {
   let prompt = `You are a web developer AI. Analyze the provided video frames and generate a complete website that matches what is shown in the video.
+
+CRITICAL: COPY EXACTLY - DO NOT ADD ANYTHING EXTRA
+- Match the video EXACTLY as shown
+- Do NOT add features, elements, or styling not visible in the video
+- Do NOT improve or enhance beyond what is shown
+- Do NOT add placeholder text, lorem ipsum, or example content
+- Only include what you can see in the video frames
 
 CRITICAL REQUIREMENTS - Pay EXTREMELY close attention to:
 1. FONT FAMILY: Identify the exact font family used (e.g., Arial, Helvetica, Roboto, Inter, Georgia, Times New Roman, etc.). Use the EXACT same font family in your CSS. If you cannot identify it, use a very similar system font.
@@ -105,12 +121,37 @@ CRITICAL REQUIREMENTS - Pay EXTREMELY close attention to:
 6. Navigation elements (buttons, links, menus) and where they lead when clicked
 7. Visual styling (colors, spacing, borders, shadows, gradients, padding, margins)
 8. Interactive elements and their behavior (hover effects, click animations, transitions)
-9. Text content visible in the frames
+9. Text content visible in the frames - COPY EXACTLY, do not paraphrase or add
 10. Images, icons, and visual elements
 
-${iteration > 0 ? `This is iteration ${iteration + 1}. The previous code had some issues or didn't match the video closely enough. Please refine it to better match the video frames, especially font sizes and font families.` : ''}
+${iteration > 0 ? `\n=== ITERATION ${iteration + 1} - DIFFERENCE ANALYSIS REQUIRED ===
+This is iteration ${iteration + 1}. You MUST analyze the differences between:
+1. The video frames (what it SHOULD look like)
+2. The previous screenshot (what it CURRENTLY looks like)
+3. The previous code (what was generated)
 
-${previousCode ? `Previous code:\nHTML: ${previousCode.html.substring(0, 500)}...\nCSS: ${previousCode.css.substring(0, 500)}...\nJS: ${previousCode.js.substring(0, 500)}...\n\nPlease improve upon this code to better match the video, with special attention to fonts and font sizes.` : ''}
+CRITICAL: Before generating new code, you MUST:
+1. Compare the previous SCREENSHOT with the video frames - identify visual differences
+2. Compare the previous CODE with what the video shows - identify code issues
+3. Identify SPECIFIC differences:
+   - What fonts/font sizes are wrong? (compare screenshot to video)
+   - What colors don't match? (compare screenshot to video)
+   - What spacing/padding/margins are incorrect? (compare screenshot to video)
+   - What layout elements are missing or wrong? (compare screenshot to video)
+   - What interactive elements don't work or are missing? (check code functionality)
+   - What text content is wrong or missing? (compare screenshot to video)
+4. ONLY modify the parts that need fixing - keep everything else the same
+5. Make targeted, precise changes rather than regenerating everything
+6. DO NOT add anything not in the video - copy exactly
+
+Previous code summary:
+- HTML structure: ${previousCode.html ? previousCode.html.substring(0, 300) + '...' : 'N/A'}
+- CSS styling: ${previousCode.css ? previousCode.css.substring(0, 300) + '...' : 'N/A'}
+- JavaScript: ${previousCode.js ? previousCode.js.substring(0, 300) + '...' : 'N/A'}
+
+${previousScreenshot ? 'A screenshot of the previous attempt is included. Compare it directly with the video frames to see what needs to be fixed.' : ''}
+
+Focus on fixing ONLY the identified differences. Do not rewrite code that already matches the video.` : ''}
 
 Generate the website code as a JSON object with the following structure:
 {
@@ -129,6 +170,7 @@ Requirements:
 - Ensure JavaScript is correct and functional - test logic in your mind before outputting
 - Use proper event listeners and DOM manipulation
 - Ensure all click handlers, hover effects, and interactions work as shown in the video
+${iteration > 0 ? '- IMPORTANT: Only change what needs to be fixed. Keep working parts unchanged.' : ''}
 
 Output ONLY valid JSON, no markdown code blocks, no explanations, just the JSON object.`;
 

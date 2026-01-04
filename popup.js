@@ -102,12 +102,19 @@ async function processVideo(videoFile, isContinuation = false) {
     updateProgress(50, 'Generating code...');
     console.log('[STEP 4] Sending frames to Gemini API for code generation...');
     
+    let previousScreenshot = null;
+    if (isContinuation) {
+      const { lastScreenshot } = await chrome.storage.local.get(['lastScreenshot']);
+      previousScreenshot = lastScreenshot;
+    }
+    
     const response = await chrome.runtime.sendMessage({
       action: 'processVideo',
       frames: frames,
       apiKey: GEMINI_API_KEY,
       iteration: isContinuation ? currentIteration + 1 : 0,
-      previousCode: isContinuation ? await getPreviousCode() : null
+      previousCode: isContinuation ? await getPreviousCode() : null,
+      previousScreenshot: previousScreenshot
     });
     
     if (response.error) {
@@ -150,11 +157,10 @@ async function processVideo(videoFile, isContinuation = false) {
     const snapshot = await takeSnapshot(tabId);
     
     if (snapshot && snapshot.screenshot) {
-      console.log('[STEP 7 COMPLETE] Snapshot captured');
-      console.log('📸 Screenshot:', snapshot.screenshot);
-      console.log('🔗 Screenshot link (right-click to open):', snapshot.screenshot);
+      console.log('[STEP 7 COMPLETE] Snapshot captured successfully');
+      await chrome.storage.local.set({ lastScreenshot: snapshot.screenshot });
     } else {
-      console.warn('[STEP 7] Warning: Snapshot capture failed');
+      console.warn('[STEP 7] Warning: Snapshot capture failed - will use default similarity');
     }
     
     console.log('[STEP 8] Checking for console errors...');
@@ -386,19 +392,65 @@ async function createWebsiteFromCode(codeFiles) {
   console.log('[createWebsiteFromCode] Finding active tab...');
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   
-  if (activeTab && activeTab.id) {
-    console.log(`[createWebsiteFromCode] Updating tab ${activeTab.id} to ${SERVER_URL}`);
-    await chrome.tabs.update(activeTab.id, { 
-      url: SERVER_URL,
-      active: true
-    });
-    
-    await chrome.storage.local.set({
-      [`website_${activeTab.id}`]: codeFiles
-    });
-    
-    return activeTab.id;
-  }
+    if (activeTab && activeTab.id) {
+      console.log(`[createWebsiteFromCode] Updating tab ${activeTab.id} to ${SERVER_URL}`);
+      await chrome.tabs.update(activeTab.id, { 
+        url: SERVER_URL,
+        active: true
+      });
+      
+      console.log('[createWebsiteFromCode] Waiting for page to start loading...');
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      let pageLoaded = false;
+      let attempts = 0;
+      while (!pageLoaded && attempts < 10) {
+        attempts++;
+        try {
+          const updatedTab = await chrome.tabs.get(activeTab.id);
+          if (updatedTab.status === 'complete' && updatedTab.url === SERVER_URL) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            const hasContent = await chrome.scripting.executeScript({
+              target: { tabId: activeTab.id },
+              func: () => {
+                const body = document.body;
+                if (!body) return false;
+                const hasChildren = body.children.length > 0;
+                const hasText = body.textContent.trim().length > 0;
+                const computedStyle = window.getComputedStyle(body);
+                const bgColor = computedStyle.backgroundColor;
+                const isBlack = bgColor === 'rgb(0, 0, 0)' || bgColor === 'black' || bgColor === 'rgba(0, 0, 0, 0)';
+                return hasChildren || (hasText && !isBlack);
+              }
+            });
+            
+            if (hasContent && hasContent[0] && hasContent[0].result) {
+              pageLoaded = true;
+              console.log('[createWebsiteFromCode] Page loaded with content');
+            } else {
+              console.log(`[createWebsiteFromCode] Page not ready yet (attempt ${attempts}/10), waiting...`);
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+          } else {
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
+        } catch (e) {
+          console.warn(`[createWebsiteFromCode] Check attempt ${attempts} failed:`, e);
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      
+      if (!pageLoaded) {
+        console.warn('[createWebsiteFromCode] Page may not be fully loaded, but proceeding...');
+      }
+      
+      await chrome.storage.local.set({
+        [`website_${activeTab.id}`]: codeFiles
+      });
+      
+      return activeTab.id;
+    }
   
   console.log('[createWebsiteFromCode] Creating new tab...');
   const tab = await chrome.tabs.create({ 
@@ -418,7 +470,7 @@ const SCREENSHOT_COOLDOWN = 2000;
 
 async function takeSnapshot(tabId) {
   try {
-    console.log(`[takeSnapshot] Capturing screenshot of tab ${tabId}...`);
+    console.log(`[takeSnapshot] Attempting to capture screenshot of tab ${tabId}...`);
     
     const timeSinceLastScreenshot = Date.now() - lastScreenshotTime;
     if (timeSinceLastScreenshot < SCREENSHOT_COOLDOWN) {
@@ -438,115 +490,36 @@ async function takeSnapshot(tabId) {
       console.log(`[takeSnapshot] Tab found: ${tab.url}, window: ${tab.windowId}, active: ${tab.active}`);
     } catch (e) {
       console.error(`[takeSnapshot] Could not get tab ${tabId}:`, e);
-      return null;
+      return { screenshot: null, dom: null, timestamp: Date.now() };
     }
     
     if (!tab.active) {
-      console.log('[takeSnapshot] Tab is not active, activating it...');
+      console.log('[takeSnapshot] Activating tab...');
       await chrome.tabs.update(tabId, { active: true });
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    console.log('[takeSnapshot] Waiting for page to fully render (checking for black screen)...');
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 3000));
     
-    let pageReady = false;
-    let attempts = 0;
-    const maxAttempts = 5;
-    
-    while (!pageReady && attempts < maxAttempts) {
-      attempts++;
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const result = await chrome.scripting.executeScript({
-          target: { tabId: tabId },
-          func: () => {
-            const body = document.body;
-            if (!body) return { ready: false, reason: 'no body' };
-            
-            const computedStyle = window.getComputedStyle(body);
-            const bgColor = computedStyle.backgroundColor;
-            const hasContent = body.children.length > 0 || body.textContent.trim().length > 0;
-            const isBlack = bgColor === 'rgb(0, 0, 0)' || bgColor === 'black' || bgColor === 'rgba(0, 0, 0, 0)';
-            
-            return {
-              ready: document.readyState === 'complete' && hasContent && !isBlack,
-              readyState: document.readyState,
-              hasContent: hasContent,
-              isBlack: isBlack,
-              bgColor: bgColor,
-              childrenCount: body.children.length
-            };
-          }
-        });
+        console.log(`[takeSnapshot] Screenshot attempt ${attempt}/${maxAttempts}...`);
+        const windowId = tab.windowId;
+        screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+        lastScreenshotTime = Date.now();
+        console.log(`[takeSnapshot] Screenshot captured successfully on attempt ${attempt}`);
+        break;
+      } catch (screenshotError) {
+        console.warn(`[takeSnapshot] Attempt ${attempt} failed:`, screenshotError.message);
         
-        if (result && result[0] && result[0].result) {
-          const status = result[0].result;
-          console.log(`[takeSnapshot] Page status check ${attempts}/${maxAttempts}:`, status);
-          
-          if (status.ready) {
-            pageReady = true;
-            console.log('[takeSnapshot] Page is ready for screenshot');
-          } else {
-            if (status.isBlack) {
-              console.log('[takeSnapshot] Page appears black, waiting longer...');
-            }
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
+        if (attempt < maxAttempts) {
+          const waitTime = screenshotError.message?.includes('MAX_CAPTURE') ? 3000 : 2000;
+          console.log(`[takeSnapshot] Waiting ${waitTime}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
         } else {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      } catch (e) {
-        console.warn(`[takeSnapshot] Page check attempt ${attempts} failed:`, e);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
-    
-    if (!pageReady) {
-      console.warn('[takeSnapshot] Page may not be fully ready, but proceeding with screenshot...');
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    try {
-      const windowId = tab.windowId;
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-      lastScreenshotTime = Date.now();
-      console.log('[takeSnapshot] Screenshot captured successfully');
-    } catch (screenshotError) {
-      if (screenshotError.message && screenshotError.message.includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND')) {
-        console.warn('[takeSnapshot] Rate limit hit, waiting 2 seconds before retry...');
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        try {
-          const windowId = tab.windowId;
-          screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-          lastScreenshotTime = Date.now();
-          console.log('[takeSnapshot] Screenshot captured after rate limit wait');
-        } catch (retryError) {
-          console.error('[takeSnapshot] Still failed after rate limit wait:', retryError);
-        }
-      } else if (screenshotError.message && screenshotError.message.includes('image readback failed')) {
-        console.warn('[takeSnapshot] Image readback failed - page may still be rendering. Waiting longer...');
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        try {
-          const windowId = tab.windowId;
-          screenshot = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-          lastScreenshotTime = Date.now();
-          console.log('[takeSnapshot] Screenshot captured after extended wait');
-        } catch (retryError) {
-          console.warn('[takeSnapshot] Still failed after extended wait:', retryError);
-          console.warn('[takeSnapshot] Continuing without screenshot - similarity will use default value');
-        }
-      } else {
-        console.warn('[takeSnapshot] First capture attempt failed:', screenshotError);
-        try {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          screenshot = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-          lastScreenshotTime = Date.now();
-          console.log('[takeSnapshot] Screenshot captured with null windowId (active window)');
-        } catch (e) {
-          console.warn('[takeSnapshot] Could not capture screenshot:', e);
-          console.warn('[takeSnapshot] Continuing without screenshot - similarity will use default value');
+          console.warn('[takeSnapshot] All screenshot attempts failed - continuing without screenshot');
+          screenshot = null;
         }
       }
     }
@@ -632,50 +605,109 @@ async function checkConsoleErrors(tabId) {
 }
 
 async function compareWithVideo(snapshot, videoFrames) {
-  console.log('[compareWithVideo] Starting comparison...');
-  if (!snapshot || !snapshot.screenshot || !videoFrames || videoFrames.length === 0) {
-    console.warn('[compareWithVideo] Missing snapshot or frames, returning default similarity 0.5');
+  console.log('[compareWithVideo] Starting detailed comparison...');
+  
+  if (!videoFrames || videoFrames.length === 0) {
+    console.warn('[compareWithVideo] No video frames available, returning default similarity 0.5');
     return 0.5;
   }
   
-  try {
-    const lastFrame = videoFrames[videoFrames.length - 1];
-    console.log(`[compareWithVideo] Comparing with video frame ${videoFrames.length} (last frame)`);
-    
-    const screenshotImg = new Image();
-    const videoFrameImg = new Image();
-    
-    return new Promise((resolve) => {
-      let loaded = 0;
-      const onLoad = () => {
-        loaded++;
-        if (loaded === 2) {
-          const widthDiff = Math.abs(screenshotImg.width - videoFrameImg.width) / Math.max(screenshotImg.width, videoFrameImg.width);
-          const heightDiff = Math.abs(screenshotImg.height - videoFrameImg.height) / Math.max(screenshotImg.height, videoFrameImg.height);
-          
-          console.log(`[compareWithVideo] Screenshot dimensions: ${screenshotImg.width}x${screenshotImg.height}`);
-          console.log(`[compareWithVideo] Video frame dimensions: ${videoFrameImg.width}x${videoFrameImg.height}`);
-          console.log(`[compareWithVideo] Width difference: ${(widthDiff * 100).toFixed(1)}%, Height difference: ${(heightDiff * 100).toFixed(1)}%`);
-          
-          const similarity = 1 - (widthDiff + heightDiff) / 2;
-          const baseSimilarity = Math.max(0.6, similarity);
-          const finalSimilarity = Math.min(0.95, baseSimilarity + (Math.random() * 0.1));
-          
-          console.log(`[compareWithVideo] Calculated similarity: ${(finalSimilarity * 100).toFixed(1)}%`);
-          resolve(finalSimilarity);
-        }
+  let similarity = 0.5;
+  const checks = [];
+  
+  let dimensionSimilarity = 0;
+  
+  if (snapshot && snapshot.screenshot) {
+    try {
+      const lastFrame = videoFrames[videoFrames.length - 1];
+      console.log(`[compareWithVideo] Comparing screenshot with video frame ${videoFrames.length} (last frame)`);
+      
+      const screenshotImg = new Image();
+      const videoFrameImg = new Image();
+      
+      await new Promise((resolve) => {
+        let loaded = 0;
+        const onLoad = () => {
+          loaded++;
+          if (loaded === 2) {
+            const widthDiff = Math.abs(screenshotImg.width - videoFrameImg.width) / Math.max(screenshotImg.width, videoFrameImg.width);
+            const heightDiff = Math.abs(screenshotImg.height - videoFrameImg.height) / Math.max(screenshotImg.height, videoFrameImg.height);
+            
+            console.log(`[compareWithVideo] Screenshot dimensions: ${screenshotImg.width}x${screenshotImg.height}`);
+            console.log(`[compareWithVideo] Video frame dimensions: ${videoFrameImg.width}x${videoFrameImg.height}`);
+            console.log(`[compareWithVideo] Width difference: ${(widthDiff * 100).toFixed(1)}%, Height difference: ${(heightDiff * 100).toFixed(1)}%`);
+            
+            dimensionSimilarity = 1 - (widthDiff + heightDiff) / 2;
+            checks.push({ type: 'dimensions', score: dimensionSimilarity });
+            
+            console.log(`[compareWithVideo] Dimension similarity: ${(dimensionSimilarity * 100).toFixed(1)}%`);
+            resolve();
+          }
+        };
+        
+        screenshotImg.onload = onLoad;
+        videoFrameImg.onload = onLoad;
+        
+        screenshotImg.src = snapshot.screenshot;
+        videoFrameImg.src = lastFrame.image;
+      });
+    } catch (error) {
+      console.error('[compareWithVideo] Error comparing images:', error);
+      console.log('[compareWithVideo] Continuing with DOM-based comparison...');
+    }
+  }
+  
+  if (snapshot && snapshot.dom) {
+    console.log('[compareWithVideo] Performing detailed DOM analysis...');
+    try {
+      const dom = snapshot.dom;
+      const html = dom.html || '';
+      
+      const domChecks = {
+        hasContent: html.length > 500,
+        hasStructure: (html.match(/<div|<section|<header|<nav|<main|<article/gi) || []).length >= 3,
+        hasStyling: html.includes('<style>') || html.includes('style='),
+        hasScripts: html.includes('<script>') || html.includes('onclick='),
+        hasText: (html.match(/<p|<h1|<h2|<h3|<span|<a/gi) || []).length >= 5,
+        hasButtons: (html.match(/<button|<input.*type=["'](button|submit)["']/gi) || []).length > 0,
+        hasNavigation: html.includes('<nav') || html.includes('navigation'),
+        hasLayout: html.includes('flex') || html.includes('grid') || html.includes('display')
       };
       
-      screenshotImg.onload = onLoad;
-      videoFrameImg.onload = onLoad;
+      let domScore = 0;
+      const totalChecks = Object.keys(domChecks).length;
+      const passedChecks = Object.values(domChecks).filter(v => v).length;
+      domScore = passedChecks / totalChecks;
       
-      screenshotImg.src = snapshot.screenshot;
-      videoFrameImg.src = lastFrame.image;
-    });
-  } catch (error) {
-    console.error('[compareWithVideo] Error comparing images:', error);
-    return 0.7;
+      console.log('[compareWithVideo] DOM checks:', domChecks);
+      console.log(`[compareWithVideo] DOM structure score: ${(domScore * 100).toFixed(1)}% (${passedChecks}/${totalChecks} checks passed)`);
+      
+      const domScoreWeighted = domScore * 0.4;
+      similarity += domScoreWeighted;
+      console.log(`[compareWithVideo] DOM contribution: ${(domScoreWeighted * 100).toFixed(1)}%`);
+    } catch (error) {
+      console.error('[compareWithVideo] Error in DOM comparison:', error);
+    }
   }
+  
+  if (dimensionSimilarity > 0) {
+    const dimensionWeighted = dimensionSimilarity * 0.5;
+    similarity += dimensionWeighted;
+    console.log(`[compareWithVideo] Dimension contribution: ${(dimensionWeighted * 100).toFixed(1)}%`);
+  }
+  
+  if (similarity === 0.5) {
+    console.log('[compareWithVideo] No screenshot or DOM available - using default similarity');
+    similarity = 0.5;
+    console.log(`[compareWithVideo] Default similarity: ${(similarity * 100).toFixed(1)}%`);
+  }
+  
+  const finalSimilarity = Math.min(0.98, Math.max(0.1, similarity));
+  
+  console.log(`[compareWithVideo] Combined base score: ${(similarity * 100).toFixed(1)}%`);
+  console.log(`[compareWithVideo] Final similarity: ${(finalSimilarity * 100).toFixed(1)}%`);
+  
+  return finalSimilarity;
 }
 
 async function saveCode(code) {
