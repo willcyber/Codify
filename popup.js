@@ -339,64 +339,170 @@ async function extractFrames(videoFile) {
   });
 }
 
+function injectCSSAndJS(htmlContent, css, js, nonce) {
+  console.log('[injectCSSAndJS] Starting injection...');
+  console.log('[injectCSSAndJS] CSS provided:', !!css, 'Length:', css?.length || 0);
+  console.log('[injectCSSAndJS] JS provided:', !!js, 'Length:', js?.length || 0);
+  console.log('[injectCSSAndJS] HTML already has <style>?', htmlContent.includes('<style>'));
+  console.log('[injectCSSAndJS] HTML already has <script>?', htmlContent.includes('<script>'));
+  
+  if (htmlContent.includes('<style>')) {
+    htmlContent = htmlContent.replace(/<style>[\s\S]*?<\/style>/gi, '');
+    console.log('[injectCSSAndJS] Removed existing <style> tag');
+  }
+  
+  if (css && css.trim()) {
+    const styleTag = `<style>${css}</style>`;
+    if (htmlContent.includes('</head>')) {
+      htmlContent = htmlContent.replace('</head>', `${styleTag}</head>`);
+      console.log('[injectCSSAndJS] Injected CSS before </head>');
+    } else if (htmlContent.includes('<head>')) {
+      htmlContent = htmlContent.replace('<head>', `<head>${styleTag}`);
+      console.log('[injectCSSAndJS] Injected CSS after <head>');
+    } else {
+      htmlContent = htmlContent.replace('<html>', `<html><head>${styleTag}</head>`);
+      console.log('[injectCSSAndJS] Injected CSS in new <head>');
+    }
+  } else {
+    console.warn('[injectCSSAndJS] No CSS to inject or CSS is empty');
+  }
+  
+  if (htmlContent.includes('<script>')) {
+    htmlContent = htmlContent.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '');
+    console.log('[injectCSSAndJS] Removed existing <script> tag');
+  }
+  
+  if (js && js.trim()) {
+    const scriptTag = `<script nonce="${nonce}">${js}</script>`;
+    if (htmlContent.includes('</body>')) {
+      htmlContent = htmlContent.replace('</body>', `${scriptTag}</body>`);
+      console.log('[injectCSSAndJS] Injected JS before </body>');
+    } else if (htmlContent.includes('<body>')) {
+      htmlContent = htmlContent.replace('<body>', `<body>${scriptTag}`);
+      console.log('[injectCSSAndJS] Injected JS after <body>');
+    } else {
+      htmlContent = htmlContent.replace('</html>', `${scriptTag}</html>`);
+      console.log('[injectCSSAndJS] Injected JS before </html>');
+    }
+  } else {
+    console.warn('[injectCSSAndJS] No JS to inject or JS is empty');
+  }
+  
+  console.log('[injectCSSAndJS] Final HTML has <style>?', htmlContent.includes('<style>'));
+  console.log('[injectCSSAndJS] Final HTML has <script>?', htmlContent.includes('<script>'));
+  
+  return htmlContent;
+}
+
 async function createWebsiteFromCode(codeFiles) {
   console.log('[createWebsiteFromCode] Building HTML from generated code...');
   const nonce = btoa(Math.random().toString(36)).substring(0, 16);
-  
-  let htmlContent = codeFiles.html || '<!DOCTYPE html><html><head><title>Generated Website</title></head><body></body></html>';
-  console.log(`[createWebsiteFromCode] HTML length: ${htmlContent.length} chars, CSS length: ${codeFiles.css?.length || 0} chars, JS length: ${codeFiles.js?.length || 0} chars`);
-  
-  if (codeFiles.css && !htmlContent.includes('<style>') && !htmlContent.includes('</style>')) {
-    const styleTag = `<style>${codeFiles.css}</style>`;
-    if (htmlContent.includes('</head>')) {
-      htmlContent = htmlContent.replace('</head>', `${styleTag}</head>`);
-    } else if (htmlContent.includes('<head>')) {
-      htmlContent = htmlContent.replace('<head>', `<head>${styleTag}`);
-    } else {
-      htmlContent = htmlContent.replace('<html>', `<html><head>${styleTag}</head>`);
-    }
-  }
-  
-  if (codeFiles.js && !htmlContent.includes('<script>') && !htmlContent.includes('</script>')) {
-    const scriptTag = `<script nonce="${nonce}">${codeFiles.js}</script>`;
-    if (htmlContent.includes('</body>')) {
-      htmlContent = htmlContent.replace('</body>', `${scriptTag}</body>`);
-    } else if (htmlContent.includes('<body>')) {
-      htmlContent = htmlContent.replace('<body>', `<body>${scriptTag}`);
-    } else {
-      htmlContent = htmlContent.replace('</html>', `${scriptTag}</html>`);
-    }
-  }
-  
   const SERVER_URL = 'http://localhost:8765';
   
-  console.log('[createWebsiteFromCode] Updating local server with generated HTML...');
-  try {
-    const response = await fetch(`${SERVER_URL}/update`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ html: htmlContent })
+  if (codeFiles.pages && Array.isArray(codeFiles.pages)) {
+    console.log(`[createWebsiteFromCode] ✅ Multi-page format detected: ${codeFiles.pages.length} pages`);
+    const pageNames = codeFiles.pages.map(p => p.name || 'index.html').join(', ');
+    console.log(`[createWebsiteFromCode] Pages detected: ${pageNames}`);
+    console.log(`[createWebsiteFromCode] CSS length: ${codeFiles.css?.length || 0} chars, JS length: ${codeFiles.js?.length || 0} chars`);
+    console.log(`[createWebsiteFromCode] CSS preview: ${codeFiles.css?.substring(0, 100) || 'NONE'}...`);
+    console.log(`[createWebsiteFromCode] JS preview: ${codeFiles.js?.substring(0, 100) || 'NONE'}...`);
+    
+    const processedPages = codeFiles.pages.map((page, index) => {
+      console.log(`[createWebsiteFromCode] Processing page ${index + 1}: ${page.name}`);
+      console.log(`[createWebsiteFromCode] Page HTML length: ${page.html?.length || 0} chars`);
+      const processed = injectCSSAndJS(page.html, codeFiles.css, codeFiles.js, nonce);
+      console.log(`[createWebsiteFromCode] Page ${index + 1} processed, final HTML length: ${processed.length} chars`);
+      return {
+        name: page.name || 'index.html',
+        html: processed
+      };
     });
     
-    if (!response.ok) {
-      throw new Error('Failed to update local server');
+    console.log('[createWebsiteFromCode] Updating local server with multiple pages...');
+    try {
+      const response = await fetch(`${SERVER_URL}/update`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ pages: processedPages })
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to update local server');
+      }
+      const result = await response.json();
+      console.log(`[createWebsiteFromCode] ✅ Server updated successfully with ${processedPages.length} pages`);
+      console.log(`[createWebsiteFromCode] Available pages: ${result.pages?.join(', ') || pageNames}`);
+      console.log(`[createWebsiteFromCode] Access pages at: ${SERVER_URL}/index.html, ${SERVER_URL}/cool.html, etc.`);
+    } catch (error) {
+      console.error('[createWebsiteFromCode] Error updating local server:', error);
+      throw new Error('Local server not running. Please start the server by running: node server.js');
     }
-    console.log('[createWebsiteFromCode] Server updated successfully');
-  } catch (error) {
-    console.error('[createWebsiteFromCode] Error updating local server:', error);
-    throw new Error('Local server not running. Please start the server by running: node server.js');
+  }
+  else {
+    let htmlContent = codeFiles.html || '<!DOCTYPE html><html><head><title>Generated Website</title></head><body></body></html>';
+    console.log(`[createWebsiteFromCode] ⚠️ Single-page format detected (no multiple pages found in video)`);
+    console.log(`[createWebsiteFromCode] HTML length: ${htmlContent.length} chars, CSS length: ${codeFiles.css?.length || 0} chars, JS length: ${codeFiles.js?.length || 0} chars`);
+    
+    htmlContent = injectCSSAndJS(htmlContent, codeFiles.css, codeFiles.js, nonce);
+    
+    console.log('[createWebsiteFromCode] Updating local server with generated HTML...');
+    try {
+      const response = await fetch(`${SERVER_URL}/update`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ html: htmlContent })
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to update local server');
+      }
+      console.log('[createWebsiteFromCode] Server updated successfully');
+    } catch (error) {
+      console.error('[createWebsiteFromCode] Error updating local server:', error);
+      throw new Error('Local server not running. Please start the server by running: node server.js');
+    }
   }
   
   console.log('[createWebsiteFromCode] Finding active tab...');
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   
     if (activeTab && activeTab.id) {
-      console.log(`[createWebsiteFromCode] Updating tab ${activeTab.id} to ${SERVER_URL}`);
-      await chrome.tabs.update(activeTab.id, { 
-        url: SERVER_URL,
-        active: true
+      let startingUrl = SERVER_URL;
+      if (codeFiles.pages && Array.isArray(codeFiles.pages) && codeFiles.pages.length > 0 && codeFiles.startingPage) {
+        startingUrl = `${SERVER_URL}/${codeFiles.startingPage}`;
+        console.log(`[createWebsiteFromCode] Multiple pages detected - starting at page: ${codeFiles.startingPage}`);
+      } else {
+        console.log(`[createWebsiteFromCode] Single page or no startingPage - starting at base URL: ${SERVER_URL}`);
+      }
+      
+      let updateDelay = 800;
+      try {
+        const currentWindow = await chrome.windows.getCurrent();
+        if (currentWindow.type === 'popup') {
+          updateDelay = 1000;
+          console.log(`[createWebsiteFromCode] Popup detected - using ${updateDelay}ms delay to prevent popup from closing`);
+        } else {
+          updateDelay = 600;
+          console.log(`[createWebsiteFromCode] Regular window detected - using ${updateDelay}ms delay`);
+        }
+      } catch (error) {
+        console.warn('[createWebsiteFromCode] Could not check window type, using default delay:', error);
+        updateDelay = 800;
+      }
+      
+      console.log(`[createWebsiteFromCode] Updating tab ${activeTab.id} to ${startingUrl} (using ${updateDelay}ms async update to keep popup open)`);
+      
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          chrome.tabs.update(activeTab.id, { 
+            url: startingUrl,
+            active: false
+          }).catch(err => console.error('[createWebsiteFromCode] Error updating tab:', err));
+        }, updateDelay);
       });
       
       console.log('[createWebsiteFromCode] Waiting for page to start loading...');
@@ -408,7 +514,7 @@ async function createWebsiteFromCode(codeFiles) {
         attempts++;
         try {
           const updatedTab = await chrome.tabs.get(activeTab.id);
-          if (updatedTab.status === 'complete' && updatedTab.url === SERVER_URL) {
+          if (updatedTab.status === 'complete' && (updatedTab.url === startingUrl || updatedTab.url.startsWith(SERVER_URL))) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             
             const hasContent = await chrome.scripting.executeScript({
