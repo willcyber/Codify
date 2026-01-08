@@ -2,7 +2,7 @@ const http = require('http');
 const url = require('url');
 
 let currentHTML = '<!DOCTYPE html><html><head><title>Codify - No website generated yet</title></head><body><h1>Waiting for website...</h1></body></html>';
-let pages = {}; // Store multiple pages: { "index.html": "<html>...", "cool.html": "<html>..." }
+let pages = {};
 const PORT = 8765;
 
 const server = http.createServer((req, res) => {
@@ -17,7 +17,6 @@ const server = http.createServer((req, res) => {
       try {
         const data = JSON.parse(body);
         
-        // Handle multi-page format
         if (data.pages && Array.isArray(data.pages)) {
           pages = {};
           data.pages.forEach(page => {
@@ -26,14 +25,12 @@ const server = http.createServer((req, res) => {
               console.log(`[Server] Registered page: ${page.name}`);
             }
           });
-          // Set default page (index.html or first page)
           currentHTML = pages['index.html'] || pages[Object.keys(pages)[0]] || currentHTML;
           console.log(`[Server] Multi-page site updated. Total pages: ${Object.keys(pages).length}`);
           console.log(`[Server] Available pages: ${Object.keys(pages).join(', ')}`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, pages: Object.keys(pages) }));
         }
-        // Handle single-page format (backward compatible)
         else if (data.html) {
           currentHTML = data.html;
           pages = { 'index.html': data.html };
@@ -49,7 +46,13 @@ const server = http.createServer((req, res) => {
       }
     });
   } else if (req.method === 'GET') {
-    // Serve specific page or default
+
+    if (parsedUrl.pathname === '/favicon.ico') {
+      res.writeHead(204, { 'Content-Type': 'image/x-icon' });
+      res.end();
+      return;
+    }
+    
     const pathname = parsedUrl.pathname;
     let htmlToServe = currentHTML;
     
@@ -57,7 +60,7 @@ const server = http.createServer((req, res) => {
       htmlToServe = pages['index.html'] || currentHTML;
       console.log(`[Server] Serving: / (index.html)`);
     } else if (pathname.startsWith('/')) {
-      const pageName = pathname.substring(1); // Remove leading /
+      const pageName = pathname.substring(1);
       htmlToServe = pages[pageName] || currentHTML;
       if (pages[pageName]) {
         console.log(`[Server] Serving: ${pathname} (${pageName})`);

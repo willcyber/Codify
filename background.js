@@ -31,16 +31,57 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
     
-    processVideoWithGemini(request.frames, apiKey, request.iteration, request.previousCode, request.previousScreenshot)
+    processVideoWithGemini(request.frames, apiKey, request.iteration, request.previousCode, request.previousScreenshot, request.previousFeedback, request.previousSummary)
       .then(result => sendResponse(result))
       .catch(error => sendResponse({ error: error.message }));
     return true;
   }
+  
+  if (request.action === 'analyzeSimilarity') {
+    console.log('[background] Received analyzeSimilarity request');
+    const apiKey = GEMINI_API_KEY || request.apiKey;
+    if (!apiKey || apiKey === 'your_api_key_here' || (typeof apiKey === 'string' && apiKey.trim().length === 0)) {
+      console.error('[background] API key not configured for similarity analysis');
+      sendResponse({ error: 'API key not configured' });
+      return true;
+    }
+    
+    console.log('[background] Calling analyzeSimilarityWithGemini...');
+    analyzeSimilarityWithGemini(request.screenshot, request.videoFrames, apiKey)
+      .then(result => {
+        console.log('[background] Similarity analysis result:', result);
+        console.log('[background] Result size:', JSON.stringify(result).length, 'bytes');
+        try {
+          const responseSent = sendResponse(result);
+          console.log('[background] sendResponse called, returned:', responseSent);
+        } catch (e) {
+          console.error('[background] Error sending response:', e);
+          console.error('[background] Error stack:', e.stack);
+        }
+      })
+      .catch(error => {
+        console.error('[background] Error in similarity analysis:', error);
+        console.error('[background] Error stack:', error.stack);
+        try {
+          sendResponse({ 
+            error: error.message || 'Unknown error in similarity analysis',
+            similarity: 0.5,
+            feedback: [error.message || 'Analysis failed'],
+            summary: 'Error occurred during analysis'
+          });
+        } catch (e) {
+          console.error('[background] Error sending error response:', e);
+        }
+      });
+    return true;
+  }
+  
+  return false;
 });
 
-async function processVideoWithGemini(frames, apiKey, iteration, previousCode, previousScreenshot) {
+async function processVideoWithGemini(frames, apiKey, iteration, previousCode, previousScreenshot, previousFeedback, previousSummary) {
   try {
-    const prompt = buildPrompt(frames, iteration, previousCode, previousScreenshot);
+    const prompt = buildPrompt(frames, iteration, previousCode, previousScreenshot, previousFeedback, previousSummary);
     
     console.log('=== GEMINI PROMPT INFO ===');
     console.log('Prompt length:', prompt.length);
@@ -126,7 +167,248 @@ async function processVideoWithGemini(frames, apiKey, iteration, previousCode, p
   }
 }
 
-function buildPrompt(frames, iteration, previousCode, previousScreenshot) {
+async function analyzeSimilarityWithGemini(screenshot, videoFrames, apiKey) {
+  try {
+    console.log('[analyzeSimilarity] Starting similarity analysis...');
+    console.log('[analyzeSimilarity] Screenshot provided:', !!screenshot);
+    console.log('[analyzeSimilarity] Screenshot type:', typeof screenshot);
+    console.log('[analyzeSimilarity] Screenshot length:', screenshot?.length || 0);
+    console.log('[analyzeSimilarity] Video frames count:', videoFrames?.length || 0);
+    
+    if (!screenshot) {
+      throw new Error('Screenshot is required for similarity analysis');
+    }
+    
+    if (!videoFrames || videoFrames.length === 0) {
+      throw new Error('Video frames are required for similarity analysis');
+    }
+    
+    const prompt = buildSimilarityPrompt();
+    console.log('[analyzeSimilarity] Prompt length:', prompt.length);
+    
+    const imageParts = [];
+    
+    if (screenshot) {
+      const screenshotData = screenshot.includes(',') ? screenshot.split(',')[1] : screenshot;
+      if (!screenshotData || screenshotData.length === 0) {
+        throw new Error('Invalid screenshot data');
+      }
+      imageParts.push({
+        inline_data: {
+          mime_type: "image/png",
+          data: screenshotData
+        }
+      });
+      console.log('[analyzeSimilarity] Added screenshot to image parts, data length:', screenshotData.length);
+    }
+    
+    if (videoFrames && videoFrames.length > 0) {
+      let addedFrames = 0;
+      videoFrames.forEach((frame, idx) => {
+        if (!frame || !frame.image) {
+          console.warn(`[analyzeSimilarity] Frame ${idx} is missing image data`);
+          return;
+        }
+        const frameData = frame.image.includes(',') ? frame.image.split(',')[1] : frame.image;
+        if (frameData && frameData.length > 0) {
+          imageParts.push({
+            inline_data: {
+              mime_type: "image/png",
+              data: frameData
+            }
+          });
+          addedFrames++;
+        } else {
+          console.warn(`[analyzeSimilarity] Frame ${idx} has invalid image data`);
+        }
+      });
+      console.log(`[analyzeSimilarity] Added ${addedFrames} video frames to image parts`);
+    }
+    
+    if (imageParts.length === 0) {
+      throw new Error('No valid images provided for similarity analysis');
+    }
+    
+    console.log('[analyzeSimilarity] Total image parts:', imageParts.length);
+    
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent?key=${apiKey}`;
+    
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            ...imageParts
+          ]
+        }]
+      })
+    });
+    
+    if (!response.ok) {
+      const error = await response.json();
+      const errorMsg = error.error?.message || 'Failed to call Gemini API';
+      throw new Error(errorMsg);
+    }
+    
+    const data = await response.json();
+    
+    if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+      throw new Error('Invalid response from Gemini API');
+    }
+    
+    const generatedText = data.candidates[0].content.parts[0].text;
+    
+    console.log('[analyzeSimilarity] Gemini response length:', generatedText.length);
+    console.log('[analyzeSimilarity] Gemini response preview:', generatedText.substring(0, 500));
+    
+    const analysis = parseSimilarityAnalysis(generatedText);
+    
+    console.log('[analyzeSimilarity] Parsed analysis:', analysis);
+    
+    return analysis;
+  } catch (error) {
+    console.error('[analyzeSimilarity] Error analyzing similarity with Gemini:', error);
+    console.error('[analyzeSimilarity] Error stack:', error.stack);
+    throw error;
+  }
+}
+
+function buildSimilarityPrompt() {
+  return `You are a web design analysis AI. Compare the generated website screenshot with the original video frames and provide an accurate similarity analysis.
+
+CRITICAL: ONLY report ACTUAL differences you can see. DO NOT hallucinate or make up issues that don't exist.
+
+TASK:
+1. Compare the generated website screenshot (first image) with the video frames (subsequent images)
+2. Look for REAL, VISIBLE differences between the screenshot and video
+3. Provide a similarity percentage (0-100%) based on actual visual match
+4. List ONLY specific, verifiable differences that need to be changed
+
+ANALYSIS REQUIREMENTS - CHECK THESE CAREFULLY:
+- Element sizing: Compare the actual size of elements (buttons, inputs, containers):
+  * CRITICAL: Pay EXTRA attention to HORIZONTAL dimensions (widths):
+    - Are button widths the same? Measure precisely
+    - Are input field widths the same? Measure precisely
+    - Are container widths the same? Measure precisely
+    - Are column widths, sidebar widths, content area widths the same?
+    - Is horizontal spacing between elements the same?
+    - Is the overall page/container width the same?
+  * Vertical dimensions (heights):
+    - Are button heights the same?
+    - Are input field heights the same?
+    - Are container heights the same?
+- Text fitting: Does text fit properly in its container?
+  * Does text overflow horizontally? (most common issue)
+  * Does text overflow vertically?
+  * Is text clipped?
+  * Is there awkward spacing, especially horizontal spacing?
+  * Does text fit within the width of its container?
+- Font sizes: Measure and compare font sizes - are they actually different or the same?
+- Colors: Compare actual colors - are they different or the same? (be precise with hex codes)
+- Spacing: Compare padding, margins, gaps between elements - are they actually different? Pay special attention to horizontal spacing
+- Layout: Compare element positions and alignment - are they actually misaligned? Check horizontal alignment especially
+- Element dimensions: Width, height, border-radius, etc. - are they actually different? Focus especially on width measurements
+
+FORBIDDEN:
+- DO NOT report issues that don't exist
+- DO NOT make up differences
+- DO NOT report things that are already correct
+- DO NOT be overly critical - if something matches, don't mention it
+- DO NOT report minor differences that are within acceptable tolerance
+
+OUTPUT FORMAT (JSON only):
+{
+  "similarity": 85.5,
+  "feedback": [
+    "Heading font size appears to be 24px in screenshot but 28px in video",
+    "Button width is 120px in screenshot but 150px in video",
+    "Text in input field overflows container in screenshot but fits in video",
+    "Padding around button text is 8px in screenshot but 12px in video"
+  ],
+  "summary": "Overall good match but needs font size and element dimension adjustments"
+}
+
+CRITICAL RULES:
+- Only include feedback for differences you can ACTUALLY SEE when comparing screenshot to video
+- Be precise: include measurements (px values) when reporting size differences
+- Focus on element sizing and text fitting issues
+- If something matches the video, do NOT include it in feedback
+- Provide similarity as a number between 0 and 100 based on actual visual match
+- Output ONLY valid JSON, no markdown, no explanations outside JSON`;
+}
+
+function parseSimilarityAnalysis(generatedText) {
+  try {
+    let cleanedText = generatedText.trim();
+    
+    if (cleanedText.includes('```json')) {
+      const jsonMatch = cleanedText.match(/```json\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        cleanedText = jsonMatch[1].trim();
+      }
+    } else if (cleanedText.includes('```')) {
+      const codeMatch = cleanedText.match(/```[a-z]*\s*([\s\S]*?)```/);
+      if (codeMatch) {
+        cleanedText = codeMatch[1].trim();
+      }
+    }
+    
+    cleanedText = cleanedText.replace(/^[^{]*?(\{)/, '$1');
+    
+    let firstBrace = cleanedText.indexOf('{');
+    let lastBrace = cleanedText.lastIndexOf('}');
+    
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      cleanedText = cleanedText.substring(firstBrace, lastBrace + 1);
+    }
+    
+    let braceCount = 0;
+    let jsonStart = -1;
+    let jsonEnd = -1;
+    
+    for (let i = 0; i < cleanedText.length; i++) {
+      if (cleanedText[i] === '{') {
+        if (jsonStart === -1) jsonStart = i;
+        braceCount++;
+      } else if (cleanedText[i] === '}') {
+        braceCount--;
+        if (braceCount === 0 && jsonStart !== -1) {
+          jsonEnd = i;
+          break;
+        }
+      }
+    }
+    
+    if (jsonStart !== -1 && jsonEnd !== -1) {
+      cleanedText = cleanedText.substring(jsonStart, jsonEnd + 1);
+    }
+    
+    const analysis = JSON.parse(cleanedText);
+    
+    return {
+      similarity: Math.min(100, Math.max(0, analysis.similarity || 50)) / 100,
+      feedback: analysis.feedback || [],
+      summary: analysis.summary || 'No summary provided'
+    };
+  } catch (error) {
+    console.error('Error parsing similarity analysis:', error);
+    
+    const similarityMatch = generatedText.match(/(\d+(?:\.\d+)?)\s*%/);
+    const similarity = similarityMatch ? Math.min(100, Math.max(0, parseFloat(similarityMatch[1]))) / 100 : 0.5;
+    
+    return {
+      similarity: similarity,
+      feedback: ['Could not parse detailed feedback from Gemini response'],
+      summary: 'Analysis completed but parsing failed'
+    };
+  }
+}
+
+function buildPrompt(frames, iteration, previousCode, previousScreenshot, previousFeedback, previousSummary) {
   let prompt = `You are a web developer AI. Analyze the provided video frames and generate a complete website that matches what is shown in the video.
 
 ⚠️ IMPORTANT: Videos showing browser windows often contain MULTIPLE pages. Before proceeding, you MUST check the address bar in EVERY frame to detect multiple pages. Do not assume it's a single page.
@@ -185,12 +467,33 @@ CRITICAL REQUIREMENTS - Pay EXTREMELY close attention to:
    - Any other text elements
 3. FONT WEIGHT: Match font weights exactly (normal, bold, 300, 400, 500, 600, 700, etc.)
 4. LINE HEIGHT: Match line spacing and line heights
-5. The layout and structure of the website (header, navigation, content areas, footer)
-6. Navigation elements (buttons, links, menus) and where they lead when clicked
-7. Visual styling (colors, spacing, borders, shadows, gradients, padding, margins)
-8. Interactive elements and their behavior (hover effects, click animations, transitions)
-9. Text content visible in the frames - COPY EXACTLY, do not paraphrase or add
-10. Images, icons, and visual elements
+5. ELEMENT SIZING: Match element dimensions EXACTLY:
+   - CRITICAL: Pay EXTRA attention to HORIZONTAL dimensions (widths):
+     * Button widths - measure and match EXACTLY
+     * Input field widths - measure and match EXACTLY
+     * Container widths - measure and match EXACTLY
+     * Column widths, sidebar widths, content area widths
+     * Horizontal spacing between elements
+     * Overall page/container width
+   - Vertical dimensions (heights):
+     * Button heights
+     * Input field heights
+     * Container heights
+     * Image dimensions
+   - All element dimensions must match the video precisely, with special focus on horizontal measurements
+6. TEXT FITTING: Ensure text fits properly within its container:
+   - Text should not overflow its container horizontally or vertically
+   - Text should not be clipped
+   - Padding around text should match the video (especially horizontal padding)
+   - Text should be properly centered/aligned within buttons, inputs, etc.
+   - Check that text has appropriate spacing and doesn't touch container edges
+   - Pay special attention to how text fits within the horizontal width of containers
+7. The layout and structure of the website (header, navigation, content areas, footer)
+8. Navigation elements (buttons, links, menus) and where they lead when clicked
+9. Visual styling (colors, spacing, borders, shadows, gradients, padding, margins)
+10. Interactive elements and their behavior (hover effects, click animations, transitions)
+11. Text content visible in the frames - COPY EXACTLY, do not paraphrase or add
+12. Images, icons, and visual elements
 11. MULTIPLE PAGES - REMINDER: You already checked this in STEP 1 above. If you detected multiple pages:
     - You MUST use the MULTIPLE PAGES JSON structure (see below)
     - Generate ALL pages that appear in the video - do not miss any
@@ -201,36 +504,41 @@ CRITICAL REQUIREMENTS - Pay EXTREMELY close attention to:
     - DO NOT use JavaScript show/hide (display:none/block) to simulate multiple pages
     - DO NOT use hash routing or JavaScript routing - use actual page URLs
 
-${iteration > 0 ? `\n=== ITERATION ${iteration + 1} - DIFFERENCE ANALYSIS REQUIRED ===
-This is iteration ${iteration + 1}. You MUST analyze the differences between:
-1. The video frames (what it SHOULD look like)
-2. The previous screenshot (what it CURRENTLY looks like)
-3. The previous code (what was generated)
+${iteration > 0 ? `\n=== ITERATION ${iteration + 1} - TARGETED FIXES ONLY ===
+This is iteration ${iteration + 1}. You MUST make MINIMAL, TARGETED changes.
 
-CRITICAL: Before generating new code, you MUST:
-1. Compare the previous SCREENSHOT with the video frames - identify visual differences
-2. Compare the previous CODE with what the video shows - identify code issues
-3. Identify SPECIFIC differences:
-   - What fonts/font sizes are wrong? (compare screenshot to video)
-   - What colors don't match? (compare screenshot to video)
-   - What spacing/padding/margins are incorrect? (compare screenshot to video)
-   - What layout elements are missing or wrong? (compare screenshot to video)
-   - What interactive elements don't work or are missing? (check code functionality)
-   - What text content is wrong or missing? (compare screenshot to video)
-4. ONLY modify the parts that need fixing - keep everything else the same
-5. Make targeted, precise changes rather than regenerating everything
-6. DO NOT add anything not in the video - copy exactly
-7. If multiple pages were detected, maintain separate HTML pages - DO NOT convert to JavaScript show/hide
-8. Keep navigation as actual HTML links (<a href="page.html">) - DO NOT change to JavaScript routing
+CRITICAL RULES FOR ITERATIONS:
+1. ONLY fix the specific issues listed in the feedback below
+2. Keep EVERYTHING else exactly the same - do not regenerate working code
+3. Make surgical, precise changes - only modify the CSS/HTML/JS for the specific issues
+4. DO NOT rewrite entire sections - only change what's needed
+5. DO NOT touch code that wasn't mentioned in feedback
+6. Pay special attention to element sizing and text fitting issues
+
+${previousFeedback && previousFeedback.length > 0 ? `\n=== SPECIFIC FEEDBACK TO FIX ===
+Fix ONLY these specific issues (do not change anything else):
+${previousFeedback.map((item, idx) => `${idx + 1}. ${item}`).join('\n')}
+
+${previousSummary ? `Summary: ${previousSummary}` : ''}
+
+CRITICAL INSTRUCTIONS:
+- For each feedback item above, find the corresponding code and fix ONLY that specific issue
+- If feedback mentions "font size is X but should be Y" - change ONLY that font-size property
+- If feedback mentions "element width is X but should be Y" - change ONLY that width property
+- If feedback mentions "text overflow" - adjust ONLY padding/sizing to fix text fitting
+- Keep all other code unchanged
+- Do not regenerate HTML structure unless feedback specifically mentions it
+- Do not change colors, spacing, or styling that wasn't mentioned in feedback
+- Pay close attention to element dimensions and how text fits within containers` : 'No specific feedback provided - compare screenshot with video to identify differences.'}
+
+${previousScreenshot ? 'A screenshot of the previous attempt is included. Use it to verify what currently exists before making changes.' : ''}
 
 Previous code summary:
 - HTML structure: ${previousCode.html ? previousCode.html.substring(0, 300) + '...' : 'N/A'}
 - CSS styling: ${previousCode.css ? previousCode.css.substring(0, 300) + '...' : 'N/A'}
 - JavaScript: ${previousCode.js ? previousCode.js.substring(0, 300) + '...' : 'N/A'}
 
-${previousScreenshot ? 'A screenshot of the previous attempt is included. Compare it directly with the video frames to see what needs to be fixed.' : ''}
-
-Focus on fixing ONLY the identified differences. Do not rewrite code that already matches the video.` : ''}
+REMEMBER: Make minimal changes. Only fix what's in the feedback. Keep everything else identical.` : ''}
 
 === FINAL CHECK: MULTIPLE PAGES DETECTION ===
 🚨 STOP. Before generating JSON, answer these questions HONESTLY:
@@ -249,12 +557,22 @@ Focus on fixing ONLY the identified differences. Do not rewrite code that alread
 
 Generate the website code as a JSON object. Use ONE of the following structures:
 
-SINGLE PAGE (if only one page is shown in the video):
+SINGLE PAGE (if only one page is shown in the video - NO URL changes detected):
 {
-  "html": "<!DOCTYPE html><html>...complete HTML with all structure...</html>",
-  "css": "/* Complete CSS with all styling - MUST include exact font-family and font-size for all elements */",
-  "js": "// Complete JavaScript with all interactions - ensure all interactive elements work correctly"
+  "html": "<!DOCTYPE html><html><head><title>Page Title</title></head><body>...complete HTML with ALL structure, elements, and content visible in the video...</body></html>",
+  "css": "/* Complete CSS with ALL styling - MUST include exact font-family, font-size, colors, spacing, layout, dimensions for ALL elements. Include styles for buttons, inputs, containers, text, images, and all visual elements shown in the video. */",
+  "js": "// Complete JavaScript with ALL interactions - ensure ALL interactive elements work correctly. Include event handlers, click handlers, form validations, hover effects, and all functionality shown in the video."
 }
+
+CRITICAL FOR SINGLE PAGE:
+- The "html" field MUST contain a COMPLETE, valid HTML document with <!DOCTYPE html>, <html>, <head>, and <body> tags
+- Include ALL HTML structure visible in the video - headers, navigation, content sections, buttons, forms, images, text, etc.
+- The HTML must be a complete, standalone page that works when loaded
+- The "css" field MUST contain ALL CSS styling needed - fonts, colors, spacing, layout, dimensions, borders, shadows, etc.
+- The "js" field MUST contain ALL JavaScript functionality - event listeners, DOM manipulation, form handling, interactions, etc.
+- Do NOT include CSS or JS in the HTML field - put them in separate "css" and "js" fields
+- The HTML should NOT have <style> or <script> tags - we will inject the CSS and JS separately
+- Ensure the HTML structure matches the video exactly - same elements, same hierarchy, same content
 
 MULTIPLE PAGES (USE THIS ONLY if you see DIFFERENT page names in the address bar across frames):
 {
@@ -303,21 +621,38 @@ Requirements:
 - DO NOT assume single page - actively check the address bar in each frame
 - FALLBACK: If address bar is not clearly visible but you see MAJOR content changes between frames (completely different page layouts, different titles, different main content), this also indicates multiple pages
 - For multiple pages: CSS and JavaScript must be IDENTICAL across all pages (shared in the root css and js fields)
-- 🚨 CRITICAL: All pages MUST have the EXACT same styling:
+- CRITICAL: All pages MUST have the EXACT same styling:
   * Same font families, font sizes, font weights, line heights
   * Same colors, spacing, padding, margins
   * Same layout styles, borders, shadows, effects
   * Same button styles, link styles, form styles
   * The CSS in the "css" field will be applied to ALL pages - make sure it's complete
-- 🚨 CRITICAL: All pages MUST have the EXACT same JavaScript functionality:
+- CRITICAL: All pages MUST have the EXACT same JavaScript functionality:
   * Same event handlers, same interactive behaviors
   * Same functions, same logic
   * Same click handlers, hover effects, form validations
   * The JavaScript in the "js" field will be applied to ALL pages - make sure it's complete
-- Each page's HTML should include the shared CSS and JS (in <style> and <script> tags)
-- The HTML should be a complete, standalone page
-- Include all CSS in a <style> tag or the css field (we'll inject it)
-- Include all JavaScript in a <script> tag or the js field (we'll inject it)
+- CRITICAL: Pay EXTREME attention to element sizing and text fitting:
+  * CRITICAL: Give EXTRA attention to HORIZONTAL dimensions (widths):
+    - Match button widths EXACTLY as shown in video - measure precisely
+    - Match input field widths EXACTLY as shown in video - measure precisely
+    - Match container widths EXACTLY as shown in video - measure precisely
+    - Match column widths, sidebar widths, content area widths EXACTLY
+    - Match horizontal spacing between elements EXACTLY
+    - Match overall page/container width EXACTLY
+  * Vertical dimensions (heights):
+    - Match button heights EXACTLY as shown in video
+    - Match input field heights EXACTLY as shown in video
+    - Match container heights EXACTLY as shown in video
+  * Ensure text fits properly within containers - no overflow, no clipping (especially horizontal overflow)
+  * Match padding around text to ensure proper spacing (especially horizontal padding)
+  * Verify button/input dimensions match the video precisely (especially widths)
+  * Check that text is properly centered/aligned within its container (especially horizontally)
+- For SINGLE PAGE: The HTML field must be a complete, standalone HTML document with ALL structure and content
+- For SINGLE PAGE: Do NOT include <style> or <script> tags in the HTML - put CSS in "css" field and JS in "js" field
+- For MULTIPLE PAGES: Each page's HTML should be complete and standalone (we'll inject shared CSS and JS)
+- Include all CSS in the css field (we'll inject it)
+- Include all JavaScript in the js field (we'll inject it)
 - CRITICAL FOR MULTIPLE PAGES: 
   * Each page MUST be a completely separate, independent HTML document
   * Navigation links MUST use actual HTML anchor tags with href pointing to the page filename you extracted from the video
@@ -360,6 +695,14 @@ CORRECT navigation format:
 WRONG navigation formats:
 <div onclick="showPage('page')">Link</div>  ← DO NOT use JavaScript show/hide
 <a href="#" onclick="showPage()">Link</a>  ← DO NOT use JavaScript routing
+
+🚨 FINAL REMINDER FOR SINGLE PAGE:
+- If you determined this is a SINGLE PAGE, use the SINGLE PAGE JSON structure
+- The "html" field MUST be a complete, valid HTML document - include <!DOCTYPE html>, <html>, <head>, <body> tags
+- Include ALL visible content, structure, and elements in the HTML
+- Put ALL CSS in the "css" field - do NOT put CSS in the HTML
+- Put ALL JavaScript in the "js" field - do NOT put JS in the HTML
+- The HTML should work as a standalone page when the CSS and JS are injected
 
 Output ONLY valid JSON, no markdown code blocks, no explanations, just the JSON object.`;
 

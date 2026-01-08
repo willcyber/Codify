@@ -103,9 +103,13 @@ async function processVideo(videoFile, isContinuation = false) {
     console.log('[STEP 4] Sending frames to Gemini API for code generation...');
     
     let previousScreenshot = null;
+    let previousFeedback = null;
+    let previousSummary = null;
     if (isContinuation) {
-      const { lastScreenshot } = await chrome.storage.local.get(['lastScreenshot']);
-      previousScreenshot = lastScreenshot;
+      const storage = await chrome.storage.local.get(['lastScreenshot', 'lastFeedback', 'lastSummary']);
+      previousScreenshot = storage.lastScreenshot;
+      previousFeedback = storage.lastFeedback;
+      previousSummary = storage.lastSummary;
     }
     
     const response = await chrome.runtime.sendMessage({
@@ -114,7 +118,9 @@ async function processVideo(videoFile, isContinuation = false) {
       apiKey: GEMINI_API_KEY,
       iteration: isContinuation ? currentIteration + 1 : 0,
       previousCode: isContinuation ? await getPreviousCode() : null,
-      previousScreenshot: previousScreenshot
+      previousScreenshot: previousScreenshot,
+      previousFeedback: previousFeedback,
+      previousSummary: previousSummary
     });
     
     if (response.error) {
@@ -171,16 +177,29 @@ async function processVideo(videoFile, isContinuation = false) {
       console.log('[STEP 8 COMPLETE] No console errors found');
     }
     
-    updateProgress(100, 'Complete!');
-    console.log('[STEP 9] Comparing website with video frames...');
-    const similarity = await compareWithVideo(snapshot, frames);
+    updateProgress(95, 'Comparing website with video...');
+    console.log('[STEP 9] Comparing website with video frames using Gemini...');
+    const analysis = await compareWithVideo(snapshot, frames);
+    const similarity = analysis.similarity || 0.5;
     const similarityPercent = (similarity * 100).toFixed(1);
     console.log(`[STEP 9 COMPLETE] Similarity score: ${similarityPercent}%`);
-    console.log(`📊 Current similarity: ${similarityPercent}%`);
+    console.log(`[compareWithVideo] Current similarity: ${similarityPercent}%`);
+    
+    const hasFeedback = analysis.feedback && analysis.feedback.length > 0;
+    if (hasFeedback) {
+      console.log(`[compareWithVideo] Feedback (${analysis.feedback.length} items):`, analysis.feedback);
+      await chrome.storage.local.set({ lastFeedback: analysis.feedback, lastSummary: analysis.summary });
+    }
+    if (analysis.summary) {
+      console.log(`[compareWithVideo] Summary: ${analysis.summary}`);
+    }
     
     currentIteration++;
     
-    if (currentIteration >= MAX_ITERATIONS || similarity > 0.95) {
+    const shouldContinue = currentIteration < MAX_ITERATIONS && (hasFeedback || similarity <= 0.95);
+    
+    if (!shouldContinue) {
+      updateProgress(100, 'Complete!');
       console.log(`[FINAL] Processing complete. Iterations: ${currentIteration}, Similarity: ${similarityPercent}%`);
       document.getElementById('status').style.display = 'none';
       document.getElementById('progress').style.display = 'none';
@@ -195,6 +214,9 @@ async function processVideo(videoFile, isContinuation = false) {
       await saveCode(response.code);
     } else {
       console.log(`[ITERATION ${currentIteration}/${MAX_ITERATIONS}] Similarity ${similarityPercent}% - continuing refinement...`);
+      if (hasFeedback) {
+        console.log(`[ITERATION ${currentIteration}/${MAX_ITERATIONS}] Feedback received - will refine based on feedback`);
+      }
       updateStatus(`Iteration ${currentIteration}/${MAX_ITERATIONS}. Refining...`);
       updateProgress(0, `Similarity: ${similarityPercent}%. Refining...`);
       
@@ -400,7 +422,7 @@ async function createWebsiteFromCode(codeFiles) {
   const SERVER_URL = 'http://localhost:8765';
   
   if (codeFiles.pages && Array.isArray(codeFiles.pages)) {
-    console.log(`[createWebsiteFromCode] ✅ Multi-page format detected: ${codeFiles.pages.length} pages`);
+    console.log(`[createWebsiteFromCode] Multi-page format detected: ${codeFiles.pages.length} pages`);
     const pageNames = codeFiles.pages.map(p => p.name || 'index.html').join(', ');
     console.log(`[createWebsiteFromCode] Pages detected: ${pageNames}`);
     console.log(`[createWebsiteFromCode] CSS length: ${codeFiles.css?.length || 0} chars, JS length: ${codeFiles.js?.length || 0} chars`);
@@ -432,7 +454,7 @@ async function createWebsiteFromCode(codeFiles) {
         throw new Error('Failed to update local server');
       }
       const result = await response.json();
-      console.log(`[createWebsiteFromCode] ✅ Server updated successfully with ${processedPages.length} pages`);
+      console.log(`[createWebsiteFromCode] Server updated successfully with ${processedPages.length} pages`);
       console.log(`[createWebsiteFromCode] Available pages: ${result.pages?.join(', ') || pageNames}`);
       console.log(`[createWebsiteFromCode] Access pages at: ${SERVER_URL}/index.html, ${SERVER_URL}/cool.html, etc.`);
     } catch (error) {
@@ -442,7 +464,7 @@ async function createWebsiteFromCode(codeFiles) {
   }
   else {
     let htmlContent = codeFiles.html || '<!DOCTYPE html><html><head><title>Generated Website</title></head><body></body></html>';
-    console.log(`[createWebsiteFromCode] ⚠️ Single-page format detected (no multiple pages found in video)`);
+    console.log(`[createWebsiteFromCode] Single-page format detected (no multiple pages found in video)`);
     console.log(`[createWebsiteFromCode] HTML length: ${htmlContent.length} chars, CSS length: ${codeFiles.css?.length || 0} chars, JS length: ${codeFiles.js?.length || 0} chars`);
     
     htmlContent = injectCSSAndJS(htmlContent, codeFiles.css, codeFiles.js, nonce);
@@ -605,7 +627,68 @@ async function takeSnapshot(tabId) {
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    console.log('[takeSnapshot] Waiting for page to fully render...');
+    let pageReady = false;
+    let readyAttempts = 0;
+    const maxReadyAttempts = 15;
+    
+    while (!pageReady && readyAttempts < maxReadyAttempts) {
+      readyAttempts++;
+      try {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId: tabId },
+          func: () => {
+            const body = document.body;
+            if (!body) return { ready: false, reason: 'no body' };
+            
+            const computedStyle = window.getComputedStyle(body);
+            const bgColor = computedStyle.backgroundColor;
+            const hasContent = body.children.length > 0 || body.textContent.trim().length > 0;
+            const isBlack = bgColor === 'rgb(0, 0, 0)' || bgColor === 'black' || bgColor === 'rgba(0, 0, 0, 0)';
+            const imagesLoaded = Array.from(document.images).every(img => img.complete);
+            const readyState = document.readyState === 'complete';
+            
+            return {
+              ready: readyState && hasContent && !isBlack && imagesLoaded,
+              readyState: document.readyState,
+              hasContent: hasContent,
+              isBlack: isBlack,
+              bgColor: bgColor,
+              imagesLoaded: imagesLoaded,
+              childrenCount: body.children.length
+            };
+          }
+        });
+        
+        if (result && result[0] && result[0].result) {
+          const status = result[0].result;
+          if (status.ready) {
+            pageReady = true;
+            console.log('[takeSnapshot] Page is ready for screenshot');
+          } else {
+            if (status.isBlack) {
+              console.log(`[takeSnapshot] Page appears black (attempt ${readyAttempts}/${maxReadyAttempts}), waiting...`);
+            } else if (!status.hasContent) {
+              console.log(`[takeSnapshot] Page has no content (attempt ${readyAttempts}/${maxReadyAttempts}), waiting...`);
+            } else if (!status.imagesLoaded) {
+              console.log(`[takeSnapshot] Images still loading (attempt ${readyAttempts}/${maxReadyAttempts}), waiting...`);
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } catch (e) {
+        console.warn(`[takeSnapshot] Page check attempt ${readyAttempts} failed:`, e);
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    
+    if (!pageReady) {
+      console.warn('[takeSnapshot] Page may not be fully ready after multiple checks, proceeding anyway...');
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 1000));
     
     const maxAttempts = 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -631,17 +714,8 @@ async function takeSnapshot(tabId) {
     }
     
     if (screenshot) {
-      console.log('📸 Screenshot captured!');
-      console.log('🔗 Screenshot URL (right-click to open in new tab):', screenshot);
-      console.log('💡 Tip: Right-click the URL above and select "Open in new tab" to view the screenshot');
-      console.log('💡 Or copy the URL and paste it in your browser address bar');
-      
-      const screenshotLink = document.createElement('a');
-      screenshotLink.href = screenshot;
-      screenshotLink.target = '_blank';
-      screenshotLink.textContent = '📸 View Screenshot';
-      screenshotLink.style.cssText = 'color: #4CAF50; text-decoration: underline; cursor: pointer;';
-      console.log('%c📸 View Screenshot', 'color: #4CAF50; font-weight: bold; text-decoration: underline;');
+      console.log('[takeSnapshot] Screenshot captured');
+      console.log('[takeSnapshot] Screenshot URL:', screenshot);
     } else {
       console.warn('[takeSnapshot] No screenshot captured');
     }
@@ -711,109 +785,96 @@ async function checkConsoleErrors(tabId) {
 }
 
 async function compareWithVideo(snapshot, videoFrames) {
-  console.log('[compareWithVideo] Starting detailed comparison...');
+  console.log('[compareWithVideo] Starting Gemini-based similarity analysis...');
   
   if (!videoFrames || videoFrames.length === 0) {
     console.warn('[compareWithVideo] No video frames available, returning default similarity 0.5');
-    return 0.5;
+    return { similarity: 0.5, feedback: [], summary: 'No video frames available' };
   }
   
-  let similarity = 0.5;
-  const checks = [];
+  if (!snapshot || !snapshot.screenshot) {
+    console.warn('[compareWithVideo] No screenshot available, returning default similarity 0.5');
+    return { similarity: 0.5, feedback: ['Screenshot not available for comparison'], summary: 'Screenshot capture failed' };
+  }
   
-  let dimensionSimilarity = 0;
-  
-  if (snapshot && snapshot.screenshot) {
+  try {
+    console.log('[compareWithVideo] Sending screenshot and video frames to Gemini for analysis...');
+    console.log('[compareWithVideo] Screenshot length:', snapshot.screenshot?.length || 0);
+    console.log('[compareWithVideo] Video frames count:', videoFrames?.length || 0);
+    console.log('[compareWithVideo] API key present:', !!GEMINI_API_KEY);
+    
     try {
-      const lastFrame = videoFrames[videoFrames.length - 1];
-      console.log(`[compareWithVideo] Comparing screenshot with video frame ${videoFrames.length} (last frame)`);
-      
-      const screenshotImg = new Image();
-      const videoFrameImg = new Image();
-      
-      await new Promise((resolve) => {
-        let loaded = 0;
-        const onLoad = () => {
-          loaded++;
-          if (loaded === 2) {
-            const widthDiff = Math.abs(screenshotImg.width - videoFrameImg.width) / Math.max(screenshotImg.width, videoFrameImg.width);
-            const heightDiff = Math.abs(screenshotImg.height - videoFrameImg.height) / Math.max(screenshotImg.height, videoFrameImg.height);
-            
-            console.log(`[compareWithVideo] Screenshot dimensions: ${screenshotImg.width}x${screenshotImg.height}`);
-            console.log(`[compareWithVideo] Video frame dimensions: ${videoFrameImg.width}x${videoFrameImg.height}`);
-            console.log(`[compareWithVideo] Width difference: ${(widthDiff * 100).toFixed(1)}%, Height difference: ${(heightDiff * 100).toFixed(1)}%`);
-            
-            dimensionSimilarity = 1 - (widthDiff + heightDiff) / 2;
-            checks.push({ type: 'dimensions', score: dimensionSimilarity });
-            
-            console.log(`[compareWithVideo] Dimension similarity: ${(dimensionSimilarity * 100).toFixed(1)}%`);
-            resolve();
+      const pingResponse = await chrome.runtime.sendMessage({ action: 'getApiKey' });
+      if (pingResponse && pingResponse.apiKey) {
+        console.log('[compareWithVideo] Background script is active');
+      }
+    } catch (pingError) {
+      console.warn('[compareWithVideo] Could not ping background script:', pingError);
+    }
+    
+    let response;
+    try {
+      const messagePromise = new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({
+          action: 'analyzeSimilarity',
+          screenshot: snapshot.screenshot,
+          videoFrames: videoFrames,
+          apiKey: GEMINI_API_KEY
+        }, (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(response);
           }
-        };
-        
-        screenshotImg.onload = onLoad;
-        videoFrameImg.onload = onLoad;
-        
-        screenshotImg.src = snapshot.screenshot;
-        videoFrameImg.src = lastFrame.image;
+        });
       });
+      
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout waiting for similarity analysis response (120s)')), 120000)
+      );
+      
+      response = await Promise.race([messagePromise, timeoutPromise]);
     } catch (error) {
-      console.error('[compareWithVideo] Error comparing images:', error);
-      console.log('[compareWithVideo] Continuing with DOM-based comparison...');
+      console.error('[compareWithVideo] Error sending message or timeout:', error);
+      if (error.message && error.message.includes('Extension context invalidated')) {
+        return { similarity: 0.5, feedback: ['Extension context invalidated - please reload the extension'], summary: 'Extension needs to be reloaded' };
+      }
+      if (error.message && error.message.includes('Timeout')) {
+        return { similarity: 0.5, feedback: ['Similarity analysis timed out - background script may be inactive'], summary: 'Analysis timed out' };
+      }
+      return { similarity: 0.5, feedback: [error.message || 'Failed to communicate with background script'], summary: 'Communication error' };
     }
-  }
-  
-  if (snapshot && snapshot.dom) {
-    console.log('[compareWithVideo] Performing detailed DOM analysis...');
-    try {
-      const dom = snapshot.dom;
-      const html = dom.html || '';
-      
-      const domChecks = {
-        hasContent: html.length > 500,
-        hasStructure: (html.match(/<div|<section|<header|<nav|<main|<article/gi) || []).length >= 3,
-        hasStyling: html.includes('<style>') || html.includes('style='),
-        hasScripts: html.includes('<script>') || html.includes('onclick='),
-        hasText: (html.match(/<p|<h1|<h2|<h3|<span|<a/gi) || []).length >= 5,
-        hasButtons: (html.match(/<button|<input.*type=["'](button|submit)["']/gi) || []).length > 0,
-        hasNavigation: html.includes('<nav') || html.includes('navigation'),
-        hasLayout: html.includes('flex') || html.includes('grid') || html.includes('display')
-      };
-      
-      let domScore = 0;
-      const totalChecks = Object.keys(domChecks).length;
-      const passedChecks = Object.values(domChecks).filter(v => v).length;
-      domScore = passedChecks / totalChecks;
-      
-      console.log('[compareWithVideo] DOM checks:', domChecks);
-      console.log(`[compareWithVideo] DOM structure score: ${(domScore * 100).toFixed(1)}% (${passedChecks}/${totalChecks} checks passed)`);
-      
-      const domScoreWeighted = domScore * 0.4;
-      similarity += domScoreWeighted;
-      console.log(`[compareWithVideo] DOM contribution: ${(domScoreWeighted * 100).toFixed(1)}%`);
-    } catch (error) {
-      console.error('[compareWithVideo] Error in DOM comparison:', error);
+    
+    if (!response) {
+      console.error('[compareWithVideo] No response from background script - response is undefined');
+      console.error('[compareWithVideo] This might mean the service worker is inactive');
+      return { similarity: 0.5, feedback: ['No response from similarity analysis - background script may be inactive'], summary: 'Background script did not respond' };
     }
+    
+    console.log('[compareWithVideo] Received response:', response);
+    
+    if (response.error) {
+      console.error('[compareWithVideo] Error from Gemini:', response.error);
+      return { similarity: 0.5, feedback: [response.error], summary: 'Analysis failed' };
+    }
+    
+    console.log('[compareWithVideo] Gemini analysis complete');
+    console.log(`[compareWithVideo] Similarity: ${(response.similarity * 100).toFixed(1)}%`);
+    console.log(`[compareWithVideo] Feedback items: ${response.feedback?.length || 0}`);
+    console.log('[compareWithVideo] Summary:', response.summary);
+    if (response.feedback && response.feedback.length > 0) {
+      console.log('[compareWithVideo] Feedback:', response.feedback);
+    }
+    
+    return {
+      similarity: response.similarity || 0.5,
+      feedback: response.feedback || [],
+      summary: response.summary || 'Analysis completed'
+    };
+  } catch (error) {
+    console.error('[compareWithVideo] Error during similarity analysis:', error);
+    return { similarity: 0.5, feedback: [error.message], summary: 'Analysis error occurred' };
   }
-  
-  if (dimensionSimilarity > 0) {
-    const dimensionWeighted = dimensionSimilarity * 0.5;
-    similarity += dimensionWeighted;
-    console.log(`[compareWithVideo] Dimension contribution: ${(dimensionWeighted * 100).toFixed(1)}%`);
-  }
-  
-  if (similarity === 0.5) {
-    console.log('[compareWithVideo] No screenshot or DOM available - using default similarity');
-    similarity = 0.5;
-    console.log(`[compareWithVideo] Default similarity: ${(similarity * 100).toFixed(1)}%`);
-  }
-  
-  const finalSimilarity = Math.min(0.98, Math.max(0.1, similarity));
-  
-  console.log(`[compareWithVideo] Combined base score: ${(similarity * 100).toFixed(1)}%`);
-  console.log(`[compareWithVideo] Final similarity: ${(finalSimilarity * 100).toFixed(1)}%`);
-  
-  return finalSimilarity;
 }
 
 async function saveCode(code) {
