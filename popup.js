@@ -52,6 +52,10 @@ document.getElementById('continueBtn').addEventListener('click', async () => {
   await processVideo(selectedVideo, true);
 });
 
+document.getElementById('downloadBtn').addEventListener('click', async () => {
+  await downloadCodeAsZip();
+});
+
 async function processVideo(videoFile, isContinuation = false) {
   try {
     console.log('[STEP 1] Starting video processing...', { isContinuation, iteration: currentIteration });
@@ -60,6 +64,7 @@ async function processVideo(videoFile, isContinuation = false) {
     document.getElementById('progress').style.display = 'block';
     document.getElementById('results').style.display = 'none';
     document.getElementById('videoInfo').style.display = 'none';
+    document.getElementById('downloadBtn').style.display = 'none';
     
     let frames;
     if (isContinuation && cachedFrames) {
@@ -210,8 +215,10 @@ async function processVideo(videoFile, isContinuation = false) {
         : `Website generated successfully! Similarity: ${similarityPercent}%`;
       
       document.getElementById('resultText').textContent = resultMsg;
+      document.getElementById('downloadBtn').style.display = 'block';
       
       await saveCode(response.code);
+      await saveCodeForDownload(response.code);
     } else {
       console.log(`[ITERATION ${currentIteration}/${MAX_ITERATIONS}] Similarity ${similarityPercent}% - continuing refinement...`);
       if (hasFeedback) {
@@ -501,34 +508,39 @@ async function createWebsiteFromCode(codeFiles) {
         console.log(`[createWebsiteFromCode] Single page or no startingPage - starting at base URL: ${SERVER_URL}`);
       }
       
-      let updateDelay = 800;
-      try {
-        const currentWindow = await chrome.windows.getCurrent();
-        if (currentWindow.type === 'popup') {
-          updateDelay = 1000;
-          console.log(`[createWebsiteFromCode] Popup detected - using ${updateDelay}ms delay to prevent popup from closing`);
-        } else {
-          updateDelay = 600;
-          console.log(`[createWebsiteFromCode] Regular window detected - using ${updateDelay}ms delay`);
+      const currentUrl = activeTab.url || '';
+      const isAlreadyOnUrl = currentUrl === startingUrl || currentUrl.startsWith(startingUrl + '?') || currentUrl.startsWith(startingUrl + '#');
+      
+      if (!isAlreadyOnUrl) {
+        console.log(`[createWebsiteFromCode] Navigating to ${startingUrl} using script injection to prevent popup from closing...`);
+        
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: activeTab.id },
+            func: (url) => {
+              window.location.href = url;
+            },
+            args: [startingUrl]
+          });
+          console.log('[createWebsiteFromCode] Navigation script injected successfully');
+        } catch (error) {
+          console.warn('[createWebsiteFromCode] Script injection failed, falling back to tabs.update:', error);
+          requestAnimationFrame(() => {
+            setTimeout(() => {
+              chrome.tabs.update(activeTab.id, { 
+                url: startingUrl,
+                active: false
+              }).catch(err => console.error('[createWebsiteFromCode] Error updating tab:', err));
+            }, 500);
+          });
         }
-      } catch (error) {
-        console.warn('[createWebsiteFromCode] Could not check window type, using default delay:', error);
-        updateDelay = 800;
+        
+        console.log('[createWebsiteFromCode] Waiting for page to start loading...');
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } else {
+        console.log(`[createWebsiteFromCode] Tab is already on ${startingUrl}, no navigation needed`);
+        await new Promise(resolve => setTimeout(resolve, 200));
       }
-      
-      console.log(`[createWebsiteFromCode] Updating tab ${activeTab.id} to ${startingUrl} (using ${updateDelay}ms async update to keep popup open)`);
-      
-      requestAnimationFrame(() => {
-        setTimeout(() => {
-          chrome.tabs.update(activeTab.id, { 
-            url: startingUrl,
-            active: false
-          }).catch(err => console.error('[createWebsiteFromCode] Error updating tab:', err));
-        }, updateDelay);
-      });
-      
-      console.log('[createWebsiteFromCode] Waiting for page to start loading...');
-      await new Promise(resolve => setTimeout(resolve, 500));
       
       let pageLoaded = false;
       let attempts = 0;
@@ -881,9 +893,85 @@ async function saveCode(code) {
   await chrome.storage.local.set({ previousCode: code });
 }
 
+async function saveCodeForDownload(code) {
+  await chrome.storage.local.set({ downloadCode: code });
+}
+
 async function getPreviousCode() {
   const { previousCode } = await chrome.storage.local.get(['previousCode']);
   return previousCode;
+}
+
+async function downloadCodeAsZip() {
+  try {
+    console.log('[downloadCodeAsZip] Starting download...');
+    console.log('[downloadCodeAsZip] JSZip available?', typeof JSZip !== 'undefined');
+    
+    if (typeof JSZip === 'undefined') {
+      console.warn('[downloadCodeAsZip] JSZip not immediately available, waiting...');
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      if (typeof JSZip === 'undefined') {
+        throw new Error('JSZip library not loaded. Please reload the extension and try again.');
+      }
+    }
+    
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    let code = null;
+    
+    if (activeTab && activeTab.id) {
+      const storage = await chrome.storage.local.get([`website_${activeTab.id}`]);
+      code = storage[`website_${activeTab.id}`];
+    }
+    
+    if (!code) {
+      const storage = await chrome.storage.local.get(['downloadCode']);
+      code = storage.downloadCode;
+    }
+    
+    if (!code) {
+      throw new Error('No code available to download. Please generate a website first.');
+    }
+    
+    console.log('[downloadCodeAsZip] Generating ZIP file...');
+    
+    const zip = new JSZip();
+    const nonce = btoa(Math.random().toString(36)).substring(0, 16);
+    
+    if (code.pages && Array.isArray(code.pages)) {
+      console.log('[downloadCodeAsZip] Multi-page format detected, adding', code.pages.length, 'pages');
+      
+      code.pages.forEach(page => {
+        const pageName = page.name || 'index.html';
+        let htmlContent = page.html || '';
+        htmlContent = injectCSSAndJS(htmlContent, code.css, code.js, nonce);
+        zip.file(pageName, htmlContent);
+        console.log(`[downloadCodeAsZip] Added page: ${pageName}`);
+      });
+    } else {
+      console.log('[downloadCodeAsZip] Single-page format detected');
+      
+      let htmlContent = code.html || '<!DOCTYPE html><html><head><title>Generated Website</title></head><body></body></html>';
+      htmlContent = injectCSSAndJS(htmlContent, code.css, code.js, nonce);
+      zip.file('index.html', htmlContent);
+      console.log('[downloadCodeAsZip] Added index.html');
+    }
+    
+    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `codify-website-${Date.now()}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    console.log('[downloadCodeAsZip] ZIP file downloaded successfully');
+  } catch (error) {
+    console.error('[downloadCodeAsZip] Error:', error);
+    alert(`Error downloading code: ${error.message}`);
+  }
 }
 
 function updateStatus(text) {

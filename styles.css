@@ -84,6 +84,26 @@ h1 {
   transform: translateY(-2px);
 }
 
+.download-btn {
+  width: 100%;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  background: #FF9800;
+  color: white;
+  margin-top: 12px;
+}
+
+.download-btn:hover {
+  background: #F57C00;
+  transform: translateY(-2px);
+  box-shadow: 0 5px 15px rgba(255, 152, 0, 0.4);
+}
+
 .video-info {
   margin-top: 16px;
   padding: 12px;
