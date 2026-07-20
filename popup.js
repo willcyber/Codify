@@ -59,7 +59,12 @@ document.getElementById('downloadBtn').addEventListener('click', async () => {
 async function processVideo(videoFile, isContinuation = false) {
   try {
     console.log('[STEP 1] Starting video processing...', { isContinuation, iteration: currentIteration });
-    
+
+    if (!isContinuation) {
+      // Clear state from previous runs so refinement never uses stale code/feedback
+      await chrome.storage.local.remove(['previousCode', 'lastScreenshot', 'lastFeedback', 'lastSummary']);
+    }
+
     document.getElementById('status').style.display = 'block';
     document.getElementById('progress').style.display = 'block';
     document.getElementById('results').style.display = 'none';
@@ -133,6 +138,9 @@ async function processVideo(videoFile, isContinuation = false) {
     }
     
     console.log('[STEP 4 COMPLETE] Code generated successfully');
+    // Save immediately so the next refinement iteration gets this code,
+    // not undefined (fresh install) or code left over from an old run.
+    await saveCode(response.code);
     console.log('[STEP 5] Creating website from generated code...');
     updateProgress(70, 'Creating website...');
     updateStatus('Creating website preview...');
@@ -164,32 +172,72 @@ async function processVideo(videoFile, isContinuation = false) {
     
     await new Promise(resolve => setTimeout(resolve, 1000));
     
-    console.log('[STEP 7] Taking snapshot of generated website...');
-    const snapshot = await takeSnapshot(tabId);
+    console.log('[STEP 7] Extracting actions from original video...');
+    updateProgress(75, 'Analyzing video interactions...');
+    updateStatus('Extracting user actions from video...');
     
-    if (snapshot && snapshot.screenshot) {
-      console.log('[STEP 7 COMPLETE] Snapshot captured successfully');
-      await chrome.storage.local.set({ lastScreenshot: snapshot.screenshot });
-    } else {
-      console.warn('[STEP 7] Warning: Snapshot capture failed - will use default similarity');
+    let actionsData = null;
+    try {
+      // Pass the generated code so Gemini can align dropdown selections
+      // with the actual <option> values in the HTML it produced.
+      actionsData = await extractActionsFromVideo(frames, response.code);
+      console.log('[STEP 7 COMPLETE] Extracted', actionsData.actions?.length || 0, 'actions');
+    } catch (error) {
+      console.warn('[STEP 7] Failed to extract actions, continuing without automated interactions:', error);
     }
     
-    console.log('[STEP 8] Checking for console errors...');
-    const errors = await checkConsoleErrors(tabId);
-    if (errors.length > 0) {
-      console.warn(`[STEP 8] Found ${errors.length} console errors:`, errors);
+    console.log('[STEP 8] Performing automated interactions with video recording...');
+    updateProgress(80, 'Performing interactions...');
+    updateStatus('Automating website interactions...');
+    
+    const videoDuration = actionsData?.videoDuration || 30;
+    let recordedFrames = [];
+    
+    if (actionsData && actionsData.actions && actionsData.actions.length > 0) {
+      try {
+        recordedFrames = await performAutomatedInteractionsWithRecording(tabId, actionsData.actions, videoDuration);
+        console.log('[STEP 8 COMPLETE] Automated interactions completed');
+        console.log('[STEP 8 COMPLETE] Recorded', recordedFrames.length, 'frames during interactions');
+      } catch (error) {
+        console.error('[STEP 8] Error during automated interactions:', error);
+        console.error('[STEP 8] Stopping video recording and showing error');
+        throw error;
+      }
     } else {
-      console.log('[STEP 8 COMPLETE] No console errors found');
+      console.log('[STEP 8] No actions to perform, skipping interactions');
     }
     
+    console.log('[STEP 9] Comparing recorded video with original...');
     updateProgress(95, 'Comparing website with video...');
-    console.log('[STEP 9] Comparing website with video frames using Gemini...');
-    const analysis = await compareWithVideo(snapshot, frames);
+    updateStatus('Comparing website with video...');
+    
+    let analysis;
+    if (recordedFrames.length > 0) {
+      try {
+        analysis = await compareVideos(recordedFrames, frames);
+        const similarity = analysis.similarity || 0.5;
+        const similarityPercent = (similarity * 100).toFixed(1);
+        console.log(`[STEP 9 COMPLETE] Similarity score: ${similarityPercent}%`);
+      } catch (error) {
+        console.error('[STEP 9] Error comparing videos:', error);
+        console.error('[STEP 9] Falling back to screenshot comparison');
+        const snapshot = await takeSnapshot(tabId);
+        analysis = await compareWithVideo(snapshot, frames);
+        const similarity = analysis.similarity || 0.5;
+        const similarityPercent = (similarity * 100).toFixed(1);
+        console.log(`[STEP 9 COMPLETE] Similarity score: ${similarityPercent}%`);
+      }
+    } else {
+      console.error('[STEP 9] No recorded frames, falling back to screenshot comparison');
+      const snapshot = await takeSnapshot(tabId);
+      analysis = await compareWithVideo(snapshot, frames);
+      const similarity = analysis.similarity || 0.5;
+      const similarityPercent = (similarity * 100).toFixed(1);
+      console.log(`[STEP 9 COMPLETE] Similarity score: ${similarityPercent}%`);
+    }
+    
     const similarity = analysis.similarity || 0.5;
     const similarityPercent = (similarity * 100).toFixed(1);
-    console.log(`[STEP 9 COMPLETE] Similarity score: ${similarityPercent}%`);
-    console.log(`[compareWithVideo] Current similarity: ${similarityPercent}%`);
-    
     const hasFeedback = analysis.feedback && analysis.feedback.length > 0;
     if (hasFeedback) {
       console.log(`[compareWithVideo] Feedback (${analysis.feedback.length} items):`, analysis.feedback);
@@ -794,6 +842,1371 @@ async function checkConsoleErrors(tabId) {
     console.warn('Could not check console errors:', e);
   }
   return [];
+}
+
+async function extractActionsFromVideo(frames, code) {
+  try {
+    console.log('[extractActionsFromVideo] Extracting actions from', frames.length, 'frames');
+    updateStatus('Analyzing video for interactions...');
+    
+    const response = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Timeout waiting for action extraction response (120s)'));
+      }, 120000);
+      
+      chrome.runtime.sendMessage({
+        action: 'extractActions',
+        frames: frames,
+        code: code || null,
+        apiKey: GEMINI_API_KEY
+      }, (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+    
+    if (response.error) {
+      throw new Error(response.error);
+    }
+    
+    console.log('[extractActionsFromVideo] Extracted', response.actions?.length || 0, 'actions');
+    return response;
+  } catch (error) {
+    console.error('[extractActionsFromVideo] Error:', error);
+    throw error;
+  }
+}
+
+async function performAutomatedInteractions(tabId, actions, videoDuration) {
+  try {
+    console.log('[performAutomatedInteractions] Starting interactions on tab', tabId);
+    console.log('[performAutomatedInteractions] Actions to perform:', actions.length);
+    
+    await chrome.debugger.attach({ tabId }, "1.0");
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+    await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
+    await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
+    
+    const actionDelay = Math.max(1000, (videoDuration * 1000) / (actions.length || 1));
+    
+    for (let i = 0; i < actions.length; i++) {
+      const action = actions[i];
+      console.log(`[performAutomatedInteractions] Performing action ${i + 1}/${actions.length}:`, action.type, action.element);
+      
+      try {
+        if (action.type === 'click') {
+          const searchText = action.element.toLowerCase();
+          const actionValue = action.value || '';
+          const clickCode = `
+            (function() {
+              const searchTerms = "${searchText}".split(/[\\s,]+/).filter(t => t.length > 0);
+              const actionValue = "${actionValue}";
+              
+              const isDropdownAction = "${searchText}".toLowerCase().includes('dropdown') || "${searchText}".toLowerCase().includes('select') || "${searchText}".toLowerCase().includes('option');
+              const isOptionAction = "${searchText}".toLowerCase().includes('option') && !"${searchText}".toLowerCase().includes('dropdown');
+              
+              if (isDropdownAction) {
+                const selects = Array.from(document.querySelectorAll('select'));
+                const allSelects = selects.map(select => {
+                  const rect = select.getBoundingClientRect();
+                  const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                  const hasSize = select.offsetWidth > 0 && select.offsetHeight > 0;
+                  const label = select.closest('label')?.textContent?.toLowerCase() || '';
+                  const name = (select.name || '').toLowerCase();
+                  const id = (select.id || '').toLowerCase();
+                  
+                  const previousSibling = select.previousElementSibling?.textContent?.toLowerCase() || '';
+                  const parentText = select.parentElement?.textContent?.toLowerCase() || '';
+                  const ariaLabel = (select.getAttribute('aria-label') || '').toLowerCase();
+                  const placeholder = (select.getAttribute('placeholder') || '').toLowerCase();
+                  
+                  const optionTexts = Array.from(select.options).map(opt => opt.text.toLowerCase()).join(' ');
+                  
+                  return {
+                    element: select,
+                    label: label,
+                    name: name,
+                    id: id,
+                    previousSibling: previousSibling,
+                    parentText: parentText,
+                    ariaLabel: ariaLabel,
+                    placeholder: placeholder,
+                    optionTexts: optionTexts,
+                    visible: hasSize,
+                    inViewport: isInViewport
+                  };
+                }).filter(info => info.visible);
+                
+                console.log('[Element Search] Searching for dropdown. Search terms:', searchTerms);
+                console.log('[Element Search] Found', allSelects.length, 'visible select elements');
+                allSelects.forEach((info, idx) => {
+                  console.log(\`[Element Search] Select \${idx + 1}:\`, {
+                    label: info.label,
+                    name: info.name,
+                    id: info.id,
+                    previousSibling: info.previousSibling.substring(0, 50),
+                    ariaLabel: info.ariaLabel,
+                    optionTexts: info.optionTexts.substring(0, 100)
+                  });
+                });
+                
+                let matches = [];
+                
+                let optionToFind = actionValue.toLowerCase();
+                if (isOptionAction && !optionToFind) {
+                  const optionTerms = searchTerms.filter(t => t !== 'option' && t !== 'click');
+                  optionToFind = optionTerms.join(' ');
+                }
+                
+                for (const info of allSelects) {
+                  let score = 0;
+                  for (const term of searchTerms) {
+                    if (term === 'dropdown' || term === 'select' || term === 'option') continue;
+                    if (info.label.includes(term)) score += 3;
+                    if (info.name.includes(term)) score += 2;
+                    if (info.id.includes(term)) score += 2;
+                    if (info.previousSibling.includes(term)) score += 2;
+                    if (info.parentText.includes(term)) score += 1;
+                    if (info.ariaLabel.includes(term)) score += 2;
+                    if (info.placeholder.includes(term)) score += 2;
+                    if (info.optionTexts.includes(term)) score += 1;
+                  }
+                  
+                  if (isOptionAction && optionToFind) {
+                    if (info.optionTexts.includes(optionToFind)) {
+                      score += 10;
+                    }
+                    const optionArray = info.optionTexts.split(' ');
+                    for (const opt of optionArray) {
+                      if (opt.includes(optionToFind) || optionToFind.includes(opt)) {
+                        score += 5;
+                        break;
+                      }
+                    }
+                  }
+                  
+                  if (score > 0) {
+                    matches.push({ element: info.element, score: score, inViewport: info.inViewport });
+                    console.log(\`[Element Search] Match found with score \${score}\`);
+                  }
+                }
+                
+                matches.sort((a, b) => {
+                  if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                  return b.score - a.score;
+                });
+                
+                if (matches.length > 0) {
+                  const select = matches[0].element;
+                  const needsScroll = !matches[0].inViewport;
+                  if (needsScroll) {
+                    select.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }
+                  
+                  let optionSelected = false;
+                  let selectedOptionText = '';
+                  
+                  let optionToFind = actionValue.toLowerCase();
+                  
+                  if (isOptionAction && !optionToFind) {
+                    const optionTerms = searchTerms.filter(t => t !== 'option' && t !== 'click');
+                    optionToFind = optionTerms.join(' ');
+                  }
+                  
+                  if (optionToFind) {
+                    console.log('[Dropdown Selection] Looking for option:', optionToFind);
+                    console.log('[Dropdown Selection] Available options:', Array.from(select.options).map(o => o.text));
+                    
+                    for (let i = 0; i < select.options.length; i++) {
+                      const option = select.options[i];
+                      const optionText = option.text.toLowerCase();
+                      const optionVal = option.value.toLowerCase();
+                      
+                      if (optionText === optionToFind || optionVal === optionToFind) {
+                        select.selectedIndex = i;
+                        selectedOptionText = option.text;
+                        optionSelected = true;
+                        console.log('[Dropdown Selection] Exact match found:', option.text);
+                        break;
+                      }
+                    }
+                    
+                    if (!optionSelected) {
+                      for (let i = 0; i < select.options.length; i++) {
+                        const option = select.options[i];
+                        const optionText = option.text.toLowerCase();
+                        const optionVal = option.value.toLowerCase();
+                        
+                        if (optionText.includes(optionToFind) || optionVal.includes(optionToFind) ||
+                            optionToFind.includes(optionText) || optionToFind.includes(optionVal)) {
+                          select.selectedIndex = i;
+                          selectedOptionText = option.text;
+                          optionSelected = true;
+                          console.log('[Dropdown Selection] Partial match found:', option.text);
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  
+                  select.dispatchEvent(new Event('change', { bubbles: true }));
+                  
+                  return { 
+                    success: true, 
+                    element: select.tagName,
+                    matchedBy: matches[0].inViewport ? 'dropdown (visible)' : 'dropdown (scrolled into view)',
+                    wasScrolled: needsScroll,
+                    isDropdown: true,
+                    optionSelected: optionSelected,
+                    selectedOptionText: selectedOptionText || (select.options[select.selectedIndex]?.text || ''),
+                    optionSearched: optionToFind
+                  };
+                }
+              }
+              
+              const clickableElements = Array.from(document.querySelectorAll('button, a, [onclick], [role="button"], input[type="button"], input[type="submit"]'));
+              const allElements = clickableElements.map(el => {
+                const rect = el.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = el.offsetWidth > 0 && el.offsetHeight > 0;
+                return {
+                  element: el,
+                  text: (el.textContent || '').trim().toLowerCase(),
+                  ariaLabel: (el.getAttribute('aria-label') || '').toLowerCase(),
+                  title: (el.getAttribute('title') || '').toLowerCase(),
+                  value: (el.value || '').toLowerCase(),
+                  visible: hasSize,
+                  inViewport: isInViewport,
+                  rect: { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right }
+                };
+              }).filter(info => info.visible);
+              
+              let matches = [];
+              
+              for (const info of allElements) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (info.text.includes(term)) score += 3;
+                  if (info.ariaLabel.includes(term)) score += 2;
+                  if (info.title.includes(term)) score += 2;
+                  if (info.value.includes(term)) score += 2;
+                }
+                if (score > 0) {
+                  matches.push({ element: info.element, score: score, inViewport: info.inViewport, rect: info.rect });
+                }
+              }
+              
+              matches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (matches.length > 0) {
+                const target = matches[0].element;
+                const needsScroll = !matches[0].inViewport;
+                if (needsScroll) {
+                  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                target.click();
+                return { 
+                  success: true, 
+                  element: target.tagName,
+                  matchedBy: matches[0].inViewport ? 'text match (visible)' : 'text match (scrolled into view)',
+                  availableElements: allElements.length,
+                  wasScrolled: needsScroll
+                };
+              }
+              
+              const selects = Array.from(document.querySelectorAll('select'));
+              const allSelects = selects.map(select => {
+                const rect = select.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = select.offsetWidth > 0 && select.offsetHeight > 0;
+                const label = select.closest('label')?.textContent?.toLowerCase() || '';
+                const name = (select.name || '').toLowerCase();
+                const id = (select.id || '').toLowerCase();
+                
+                const previousSibling = select.previousElementSibling?.textContent?.toLowerCase() || '';
+                const parentText = select.parentElement?.textContent?.toLowerCase() || '';
+                const ariaLabel = (select.getAttribute('aria-label') || '').toLowerCase();
+                const placeholder = (select.getAttribute('placeholder') || '').toLowerCase();
+                
+                const optionTexts = Array.from(select.options).map(opt => opt.text.toLowerCase()).join(' ');
+                
+                return {
+                  element: select,
+                  label: label,
+                  name: name,
+                  id: id,
+                  previousSibling: previousSibling,
+                  parentText: parentText,
+                  ariaLabel: ariaLabel,
+                  placeholder: placeholder,
+                  optionTexts: optionTexts,
+                  visible: hasSize,
+                  inViewport: isInViewport
+                };
+              }).filter(info => info.visible);
+              
+              console.log('[Element Search] Fallback: Searching for dropdown. Search terms:', searchTerms);
+              console.log('[Element Search] Fallback: Found', allSelects.length, 'visible select elements');
+              
+              let selectMatches = [];
+              
+              let optionToFindFallback = actionValue.toLowerCase();
+              if (isOptionAction && !optionToFindFallback) {
+                const optionTerms = searchTerms.filter(t => t !== 'option' && t !== 'click');
+                optionToFindFallback = optionTerms.join(' ');
+              }
+              
+              for (const info of allSelects) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (term === 'dropdown' || term === 'select' || term === 'option') continue;
+                  if (info.label.includes(term)) score += 3;
+                  if (info.name.includes(term)) score += 2;
+                  if (info.id.includes(term)) score += 2;
+                  if (info.previousSibling.includes(term)) score += 2;
+                  if (info.parentText.includes(term)) score += 1;
+                  if (info.ariaLabel.includes(term)) score += 2;
+                  if (info.placeholder.includes(term)) score += 2;
+                  if (info.optionTexts.includes(term)) score += 1;
+                }
+                
+                if (isOptionAction && optionToFindFallback) {
+                  if (info.optionTexts.includes(optionToFindFallback)) {
+                    score += 10;
+                  }
+                  const optionArray = info.optionTexts.split(' ');
+                  for (const opt of optionArray) {
+                    if (opt.includes(optionToFindFallback) || optionToFindFallback.includes(opt)) {
+                      score += 5;
+                      break;
+                    }
+                  }
+                }
+                
+                if (score > 0) {
+                  selectMatches.push({ element: info.element, score: score, inViewport: info.inViewport });
+                  console.log(\`[Element Search] Fallback: Match found with score \${score}\`);
+                }
+              }
+              
+              selectMatches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (selectMatches.length > 0) {
+                const select = selectMatches[0].element;
+                const needsScroll = !selectMatches[0].inViewport;
+                if (needsScroll) {
+                  select.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                
+                let optionSelected = false;
+                let selectedOptionText = '';
+                
+                let optionToFind = optionToFindFallback || actionValue.toLowerCase();
+                
+                if (isOptionAction && !optionToFind) {
+                  const optionTerms = searchTerms.filter(t => t !== 'option' && t !== 'click');
+                  optionToFind = optionTerms.join(' ');
+                }
+                
+                if (optionToFind) {
+                  console.log('[Dropdown Selection Fallback] Looking for option:', optionToFind);
+                  console.log('[Dropdown Selection Fallback] Available options:', Array.from(select.options).map(o => o.text));
+                  
+                  for (let i = 0; i < select.options.length; i++) {
+                    const option = select.options[i];
+                    const optionText = option.text.toLowerCase();
+                    const optionVal = option.value.toLowerCase();
+                    
+                    if (optionText === optionToFind || optionVal === optionToFind) {
+                      select.selectedIndex = i;
+                      selectedOptionText = option.text;
+                      optionSelected = true;
+                      console.log('[Dropdown Selection Fallback] Exact match found:', option.text);
+                      break;
+                    }
+                  }
+                  
+                  if (!optionSelected) {
+                    for (let i = 0; i < select.options.length; i++) {
+                      const option = select.options[i];
+                      const optionText = option.text.toLowerCase();
+                      const optionVal = option.value.toLowerCase();
+                      
+                      if (optionText.includes(optionToFind) || optionVal.includes(optionToFind) ||
+                          optionToFind.includes(optionText) || optionToFind.includes(optionVal)) {
+                        select.selectedIndex = i;
+                        selectedOptionText = option.text;
+                        optionSelected = true;
+                        console.log('[Dropdown Selection Fallback] Partial match found:', option.text);
+                        break;
+                      }
+                    }
+                  }
+                }
+                
+                if (!optionSelected && select.options.length > 0) {
+                  select.selectedIndex = 0;
+                  selectedOptionText = select.options[0].text;
+                }
+                
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+                
+                return { 
+                  success: true, 
+                  element: select.tagName,
+                  matchedBy: selectMatches[0].inViewport ? 'dropdown (visible)' : 'dropdown (scrolled into view)',
+                  availableElements: allElements.length,
+                  wasScrolled: needsScroll,
+                  isDropdown: true,
+                  optionSelected: optionSelected,
+                  selectedOptionText: selectedOptionText,
+                  optionSearched: optionToFind
+                };
+              }
+              
+              const isInputAction = "${searchText}".toLowerCase().includes('input') || "${searchText}".toLowerCase().includes('text area') || "${searchText}".toLowerCase().includes('textarea') || "${searchText}".toLowerCase().includes('field');
+              
+              if (isInputAction) {
+                const inputs = Array.from(document.querySelectorAll('input, textarea'));
+                const allInputs = inputs.map(input => {
+                  const rect = input.getBoundingClientRect();
+                  const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                  const hasSize = input.offsetWidth > 0 && input.offsetHeight > 0;
+                  const placeholder = (input.placeholder || '').toLowerCase();
+                  const label = (input.closest('label')?.textContent || '').toLowerCase();
+                  const name = (input.name || '').toLowerCase();
+                  const id = (input.id || '').toLowerCase();
+                  const type = (input.type || '').toLowerCase();
+                  const tagName = input.tagName.toLowerCase();
+                  
+                  return {
+                    element: input,
+                    placeholder: placeholder,
+                    label: label,
+                    name: name,
+                    id: id,
+                    type: type,
+                    tagName: tagName,
+                    visible: hasSize,
+                    inViewport: isInViewport
+                  };
+                }).filter(info => info.visible);
+                
+                console.log('[Element Search] Fallback: Searching for input field. Search terms:', searchTerms);
+                console.log('[Element Search] Fallback: Found', allInputs.length, 'visible input elements');
+                
+                let inputMatches = [];
+                
+                for (const info of allInputs) {
+                  let score = 0;
+                  for (const term of searchTerms) {
+                    if (term === 'input' || term === 'click' || term === 'area') continue;
+                    if (info.placeholder.includes(term)) score += 3;
+                    if (info.label.includes(term)) score += 3;
+                    if (info.name.includes(term)) score += 2;
+                    if (info.id.includes(term)) score += 2;
+                    if (info.type.includes(term)) score += 1;
+                    if (info.tagName.includes(term)) score += 1;
+                  }
+                  
+                  if ("${searchText}".toLowerCase().includes('textarea') && info.tagName === 'textarea') {
+                    score += 5;
+                  }
+                  if ("${searchText}".toLowerCase().includes('text area') && info.tagName === 'textarea') {
+                    score += 5;
+                  }
+                  
+                  if (score > 0 || allInputs.length === 1) {
+                    inputMatches.push({ element: info.element, score: score, inViewport: info.inViewport });
+                  }
+                }
+                
+                inputMatches.sort((a, b) => {
+                  if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                  return b.score - a.score;
+                });
+                
+                if (inputMatches.length > 0) {
+                  const input = inputMatches[0].element;
+                  const needsScroll = !inputMatches[0].inViewport;
+                  if (needsScroll) {
+                    input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }
+                  input.focus();
+                  
+                  return { 
+                    success: true, 
+                    element: input.tagName,
+                    matchedBy: inputMatches[0].inViewport ? 'input field (visible)' : 'input field (scrolled into view)',
+                    availableElements: allElements.length,
+                    wasScrolled: needsScroll,
+                    isInput: true
+                  };
+                }
+              }
+              
+              console.log('[Element Search] No matches found. Returning error.');
+              console.log('[Element Search] Available clickable elements:', allElements.length);
+              console.log('[Element Search] Available select elements:', allSelects.length);
+              
+              return { 
+                success: false, 
+                error: 'Clickable element not found',
+                availableElements: allElements.length,
+                availableSelects: allSelects.length,
+                searchTerms: searchTerms,
+                debugInfo: {
+                  clickableElements: allElements.map(el => ({
+                    text: el.text.substring(0, 50),
+                    ariaLabel: el.ariaLabel,
+                    title: el.title,
+                    value: el.value
+                  })),
+                  selectElements: allSelects.map(sel => ({
+                    label: sel.label.substring(0, 50),
+                    name: sel.name,
+                    id: sel.id,
+                    previousSibling: sel.previousSibling.substring(0, 50),
+                    optionTexts: sel.optionTexts.substring(0, 100)
+                  }))
+                }
+              };
+            })()
+          `;
+          
+          const result = await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: clickCode, returnByValue: true }
+          );
+          
+          if (!result.result?.value?.success) {
+            const errorMsg = `Failed to click element: ${action.element}. ${result.result?.value?.error || 'Element not found'}. Available clickable elements: ${result.result?.value?.availableElements || 0}`;
+            console.error(`[performAutomatedInteractions] ${errorMsg}`);
+            console.error(`[performAutomatedInteractions] Result:`, result.result?.value);
+            await chrome.debugger.detach({ tabId });
+            throw new Error(errorMsg);
+          } else {
+            if (result.result?.value?.isDropdown) {
+              if (result.result?.value?.optionSelected) {
+                console.log(`[performAutomatedInteractions] Successfully selected dropdown option: "${result.result?.value?.selectedOptionText}"`);
+              } else {
+                console.log(`[performAutomatedInteractions] Dropdown found but no option selected. Searched for: "${result.result?.value?.optionSearched || 'none'}", Selected: "${result.result?.value?.selectedOptionText || 'none'}"`);
+              }
+            } else if (result.result?.value?.isInput) {
+              console.log(`[performAutomatedInteractions] Successfully focused input field. Matched by: ${result.result?.value?.matchedBy}`);
+            } else {
+              console.log(`[performAutomatedInteractions] Successfully clicked element. Matched by: ${result.result?.value?.matchedBy}`);
+            }
+            if (result.result?.value?.wasScrolled) {
+              console.log(`[performAutomatedInteractions] Element was scrolled into view before interaction`);
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            } else {
+              await new Promise(resolve => setTimeout(resolve, result.result?.value?.isInput ? 500 : 2000));
+            }
+          }
+          
+        } else if (action.type === 'type') {
+          const searchText = action.element.toLowerCase();
+          const typeCode = `
+            (function() {
+              const inputs = Array.from(document.querySelectorAll('input, textarea'));
+              const allInputs = inputs.map(input => {
+                const rect = input.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = input.offsetWidth > 0 && input.offsetHeight > 0;
+                return {
+                  element: input,
+                  placeholder: (input.placeholder || '').toLowerCase(),
+                  label: (input.closest('label')?.textContent || '').toLowerCase(),
+                  name: (input.name || '').toLowerCase(),
+                  id: (input.id || '').toLowerCase(),
+                  type: (input.type || '').toLowerCase(),
+                  visible: hasSize,
+                  inViewport: isInViewport,
+                  rect: { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right }
+                };
+              }).filter(info => info.visible);
+              
+              let matches = [];
+              
+              const searchTerms = "${searchText}".split(/[\\s,]+/).filter(t => t.length > 0);
+              
+              for (const info of allInputs) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (info.placeholder.includes(term)) score += 3;
+                  if (info.label.includes(term)) score += 3;
+                  if (info.name.includes(term)) score += 2;
+                  if (info.id.includes(term)) score += 2;
+                  if (info.type.includes(term)) score += 1;
+                }
+                if (score > 0) {
+                  matches.push({ element: info.element, score: score });
+                }
+              }
+              
+              if (matches.length === 0 && allInputs.length > 0) {
+                const textInputs = allInputs.filter(info => info.type === 'text' || info.type === '' || info.element.tagName === 'TEXTAREA');
+                if (textInputs.length > 0) {
+                  matches = textInputs.map(info => ({ element: info.element, score: 0.5, inViewport: info.inViewport, rect: info.rect }));
+                } else {
+                  matches = allInputs.map(info => ({ element: info.element, score: 0.5, inViewport: info.inViewport, rect: info.rect }));
+                }
+              }
+              
+              matches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (matches.length > 0) {
+                const input = matches[0].element;
+                const needsScroll = !matches[0].inViewport;
+                if (needsScroll) {
+                  input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                input.focus();
+                input.value = "${action.value}";
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return { 
+                  success: true, 
+                  element: input.tagName,
+                  matchedBy: matches[0].score > 1 ? (matches[0].inViewport ? 'text match (visible)' : 'text match (scrolled into view)') : (matches[0].inViewport ? 'first available (visible)' : 'first available (scrolled into view)'),
+                  availableInputs: allInputs.length,
+                  wasScrolled: needsScroll
+                };
+              }
+              return { 
+                success: false, 
+                error: 'No input fields found on page',
+                availableInputs: 0
+              };
+            })()
+          `;
+          
+          const result = await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: typeCode, returnByValue: true }
+          );
+          
+          if (!result.result?.value?.success) {
+            const errorMsg = `Failed to type into element: ${action.element}. ${result.result?.value?.error || 'Input field not found'}. Available inputs: ${result.result?.value?.availableInputs || 0}`;
+            console.error(`[performAutomatedInteractions] ${errorMsg}`);
+            console.error(`[performAutomatedInteractions] Result:`, result.result?.value);
+            await chrome.debugger.detach({ tabId });
+            throw new Error(errorMsg);
+          } else {
+            console.log(`[performAutomatedInteractions] Successfully typed into element. Matched by: ${result.result?.value?.matchedBy}`);
+            if (result.result?.value?.wasScrolled) {
+              console.log(`[performAutomatedInteractions] Input was scrolled into view before typing`);
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+          }
+          
+        } else if (action.type === 'navigate') {
+          const searchText = action.element.toLowerCase();
+          const navCode = `
+            (function() {
+              const searchTerms = "${searchText}".split(/[\\s,]+/).filter(t => t.length > 0);
+              const navElements = Array.from(document.querySelectorAll('a, button, [role="link"]'));
+              const allElements = navElements.map(el => {
+                const rect = el.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = el.offsetWidth > 0 && el.offsetHeight > 0;
+                return {
+                  element: el,
+                  text: (el.textContent || '').trim().toLowerCase(),
+                  ariaLabel: (el.getAttribute('aria-label') || '').toLowerCase(),
+                  href: (el.href || '').toLowerCase(),
+                  visible: hasSize,
+                  inViewport: isInViewport,
+                  rect: { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right }
+                };
+              }).filter(info => info.visible);
+              
+              let matches = [];
+              
+              for (const info of allElements) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (info.text.includes(term)) score += 3;
+                  if (info.ariaLabel.includes(term)) score += 2;
+                  if (info.href.includes(term)) score += 1;
+                }
+                if (score > 0) {
+                  matches.push({ element: info.element, score: score, inViewport: info.inViewport, rect: info.rect });
+                }
+              }
+              
+              matches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (matches.length > 0) {
+                const target = matches[0].element;
+                const needsScroll = !matches[0].inViewport;
+                if (needsScroll) {
+                  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                target.click();
+                return { 
+                  success: true, 
+                  element: target.tagName,
+                  matchedBy: matches[0].inViewport ? 'text match (visible)' : 'text match (scrolled into view)',
+                  availableElements: allElements.length,
+                  wasScrolled: needsScroll
+                };
+              }
+              return { 
+                success: false, 
+                error: 'Navigation element not found',
+                availableElements: allElements.length
+              };
+            })()
+          `;
+          
+          const result = await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: navCode, returnByValue: true }
+          );
+          
+          if (!result.result?.value?.success) {
+            const errorMsg = `Failed to navigate using element: ${action.element}. ${result.result?.value?.error || 'Navigation element not found'}. Available navigation elements: ${result.result?.value?.availableElements || 0}`;
+            console.error(`[performAutomatedInteractions] ${errorMsg}`);
+            console.error(`[performAutomatedInteractions] Result:`, result.result?.value);
+            await chrome.debugger.detach({ tabId });
+            throw new Error(errorMsg);
+          } else {
+            console.log(`[performAutomatedInteractions] Successfully navigated using element. Matched by: ${result.result?.value?.matchedBy}`);
+            if (result.result?.value?.wasScrolled) {
+              console.log(`[performAutomatedInteractions] Navigation element was scrolled into view before clicking`);
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+          }
+          
+        } else if (action.type === 'select') {
+          const searchText = action.element.toLowerCase();
+          const selectValue = action.value || '';
+          const selectCode = `
+            (function() {
+              const searchTerms = "${searchText}".split(/[\\s,]+/).filter(t => t.length > 0);
+              const selects = Array.from(document.querySelectorAll('select'));
+              const allSelects = selects.map(select => {
+                const rect = select.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = select.offsetWidth > 0 && select.offsetHeight > 0;
+                const label = select.closest('label')?.textContent?.toLowerCase() || '';
+                const name = (select.name || '').toLowerCase();
+                const id = (select.id || '').toLowerCase();
+                
+                const previousSibling = select.previousElementSibling?.textContent?.toLowerCase() || '';
+                const parentText = select.parentElement?.textContent?.toLowerCase() || '';
+                const ariaLabel = (select.getAttribute('aria-label') || '').toLowerCase();
+                const placeholder = (select.getAttribute('placeholder') || '').toLowerCase();
+                
+                const optionTexts = Array.from(select.options).map(opt => opt.text.toLowerCase()).join(' ');
+                
+                return {
+                  element: select,
+                  label: label,
+                  name: name,
+                  id: id,
+                  previousSibling: previousSibling,
+                  parentText: parentText,
+                  ariaLabel: ariaLabel,
+                  placeholder: placeholder,
+                  optionTexts: optionTexts,
+                  visible: hasSize,
+                  inViewport: isInViewport
+                };
+              }).filter(info => info.visible);
+              
+              console.log('[Select Handler] Searching for dropdown. Search terms:', searchTerms);
+              console.log('[Select Handler] Found', allSelects.length, 'visible select elements');
+              
+              let matches = [];
+              
+              for (const info of allSelects) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (term === 'dropdown' || term === 'select' || term === 'option') continue;
+                  if (info.label.includes(term)) score += 3;
+                  if (info.name.includes(term)) score += 2;
+                  if (info.id.includes(term)) score += 2;
+                  if (info.previousSibling.includes(term)) score += 2;
+                  if (info.parentText.includes(term)) score += 1;
+                  if (info.ariaLabel.includes(term)) score += 2;
+                  if (info.placeholder.includes(term)) score += 2;
+                  if (info.optionTexts.includes(term)) score += 1;
+                }
+                if (score > 0) {
+                  matches.push({ element: info.element, score: score, inViewport: info.inViewport });
+                  console.log(\`[Select Handler] Match found with score \${score}\`);
+                }
+              }
+              
+              matches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (matches.length > 0) {
+                const select = matches[0].element;
+                const needsScroll = !matches[0].inViewport;
+                if (needsScroll) {
+                  select.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                
+                const optionValue = "${selectValue}".toLowerCase();
+                let optionFound = false;
+                let selectedOptionText = '';
+                
+                console.log('[Select Handler] Looking for option:', optionValue);
+                console.log('[Select Handler] Available options:', Array.from(select.options).map(o => o.text));
+                
+                if (optionValue) {
+                  for (let i = 0; i < select.options.length; i++) {
+                    const option = select.options[i];
+                    const optionText = option.text.toLowerCase();
+                    const optionVal = option.value.toLowerCase();
+                    
+                    if (optionText === optionValue || optionVal === optionValue) {
+                      select.selectedIndex = i;
+                      selectedOptionText = option.text;
+                      optionFound = true;
+                      console.log('[Select Handler] Exact match found:', option.text);
+                      break;
+                    }
+                  }
+
+                  if (!optionFound) {
+                    for (let i = 0; i < select.options.length; i++) {
+                      const option = select.options[i];
+                      const optionText = option.text.toLowerCase();
+                      const optionVal = option.value.toLowerCase();
+                      
+                      if (optionText.includes(optionValue) || optionVal.includes(optionValue) ||
+                          optionValue.includes(optionText) || optionValue.includes(optionVal)) {
+                        select.selectedIndex = i;
+                        selectedOptionText = option.text;
+                        optionFound = true;
+                        console.log('[Select Handler] Partial match found:', option.text);
+                        break;
+                      }
+                    }
+                  }
+                }
+                
+                // If still no match found, select first option as fallback
+                if (!optionFound && select.options.length > 0) {
+                  select.selectedIndex = 0;
+                  selectedOptionText = select.options[0].text;
+                  console.log('[Select Handler] No match found, selected first option:', selectedOptionText);
+                }
+                
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+                
+                return { 
+                  success: true, 
+                  element: select.tagName,
+                  matchedBy: matches[0].inViewport ? 'text match (visible)' : 'text match (scrolled into view)',
+                  optionSelected: optionFound,
+                  selectedOptionText: selectedOptionText || (select.options[select.selectedIndex]?.text || ''),
+                  wasScrolled: needsScroll
+                };
+              }
+              
+              console.log('[Select Handler] No matches found. Available selects:', allSelects.length);
+              allSelects.forEach((info, idx) => {
+                console.log(\`[Select Handler] Select \${idx + 1}:\`, {
+                  label: info.label.substring(0, 50),
+                  name: info.name,
+                  id: info.id,
+                  previousSibling: info.previousSibling.substring(0, 50),
+                  ariaLabel: info.ariaLabel,
+                  optionTexts: info.optionTexts.substring(0, 100)
+                });
+              });
+              
+              return { 
+                success: false, 
+                error: 'Select dropdown not found',
+                availableSelects: allSelects.length
+              };
+            })()
+          `;
+          
+          const result = await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: selectCode, returnByValue: true }
+          );
+          
+          if (!result.result?.value?.success) {
+            const errorMsg = `Failed to select option in dropdown: ${action.element}. ${result.result?.value?.error || 'Dropdown not found'}`;
+            console.error(`[performAutomatedInteractions] ${errorMsg}`);
+            await chrome.debugger.detach({ tabId });
+            throw new Error(errorMsg);
+          } else {
+            console.log(`[performAutomatedInteractions] Successfully selected option "${action.value}" in dropdown`);
+            if (result.result?.value?.wasScrolled) {
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+          }
+          
+        } else if (action.type === 'checkbox') {
+          const searchText = action.element.toLowerCase();
+          const shouldCheck = action.value === 'check';
+          const checkboxCode = `
+            (function() {
+              const searchTerms = "${searchText}".split(/[\\s,]+/).filter(t => t.length > 0);
+              const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+              const allCheckboxes = checkboxes.map(cb => {
+                const rect = cb.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = cb.offsetWidth > 0 && cb.offsetHeight > 0;
+                const label = cb.closest('label')?.textContent?.toLowerCase() || cb.nextElementSibling?.textContent?.toLowerCase() || '';
+                const name = (cb.name || '').toLowerCase();
+                const id = (cb.id || '').toLowerCase();
+                return {
+                  element: cb,
+                  label: label,
+                  name: name,
+                  id: id,
+                  visible: hasSize,
+                  inViewport: isInViewport
+                };
+              }).filter(info => info.visible);
+              
+              let matches = [];
+              
+              for (const info of allCheckboxes) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (info.label.includes(term)) score += 3;
+                  if (info.name.includes(term)) score += 2;
+                  if (info.id.includes(term)) score += 2;
+                }
+                if (score > 0) {
+                  matches.push({ element: info.element, score: score, inViewport: info.inViewport });
+                }
+              }
+              
+              matches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (matches.length > 0) {
+                const checkbox = matches[0].element;
+                const needsScroll = !matches[0].inViewport;
+                if (needsScroll) {
+                  checkbox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                
+                if (checkbox.checked !== ${shouldCheck}) {
+                  checkbox.click();
+                }
+                
+                return { 
+                  success: true, 
+                  element: checkbox.tagName,
+                  matchedBy: matches[0].inViewport ? 'text match (visible)' : 'text match (scrolled into view)',
+                  wasScrolled: needsScroll
+                };
+              }
+              return { 
+                success: false, 
+                error: 'Checkbox not found',
+                availableCheckboxes: allCheckboxes.length
+              };
+            })()
+          `;
+          
+          const result = await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: checkboxCode, returnByValue: true }
+          );
+          
+          if (!result.result?.value?.success) {
+            const errorMsg = `Failed to ${shouldCheck ? 'check' : 'uncheck'} checkbox: ${action.element}. ${result.result?.value?.error || 'Checkbox not found'}`;
+            console.error(`[performAutomatedInteractions] ${errorMsg}`);
+            await chrome.debugger.detach({ tabId });
+            throw new Error(errorMsg);
+          } else {
+            console.log(`[performAutomatedInteractions] Successfully ${shouldCheck ? 'checked' : 'unchecked'} checkbox`);
+            if (result.result?.value?.wasScrolled) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+          }
+          
+        } else if (action.type === 'radio') {
+          const searchText = action.element.toLowerCase();
+          const radioValue = action.value || '';
+          const radioCode = `
+            (function() {
+              const searchTerms = "${searchText}".split(/[\\s,]+/).filter(t => t.length > 0);
+              const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+              const allRadios = radios.map(radio => {
+                const rect = radio.getBoundingClientRect();
+                const isInViewport = rect.top >= 0 && rect.left >= 0 && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+                const hasSize = radio.offsetWidth > 0 && radio.offsetHeight > 0;
+                const label = radio.closest('label')?.textContent?.toLowerCase() || radio.nextElementSibling?.textContent?.toLowerCase() || '';
+                const name = (radio.name || '').toLowerCase();
+                const id = (radio.id || '').toLowerCase();
+                const value = (radio.value || '').toLowerCase();
+                return {
+                  element: radio,
+                  label: label,
+                  name: name,
+                  id: id,
+                  value: value,
+                  visible: hasSize,
+                  inViewport: isInViewport
+                };
+              }).filter(info => info.visible);
+              
+              let matches = [];
+              const optionValue = "${radioValue}".toLowerCase();
+              
+              for (const info of allRadios) {
+                let score = 0;
+                for (const term of searchTerms) {
+                  if (info.label.includes(term)) score += 3;
+                  if (info.name.includes(term)) score += 2;
+                  if (info.id.includes(term)) score += 2;
+                }
+                if (optionValue && (info.label.includes(optionValue) || info.value === optionValue)) {
+                  score += 5;
+                }
+                if (score > 0) {
+                  matches.push({ element: info.element, score: score, inViewport: info.inViewport });
+                }
+              }
+              
+              matches.sort((a, b) => {
+                if (a.inViewport !== b.inViewport) return a.inViewport ? -1 : 1;
+                return b.score - a.score;
+              });
+              
+              if (matches.length > 0) {
+                const radio = matches[0].element;
+                const needsScroll = !matches[0].inViewport;
+                if (needsScroll) {
+                  radio.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+                
+                radio.click();
+                
+                return { 
+                  success: true, 
+                  element: radio.tagName,
+                  matchedBy: matches[0].inViewport ? 'text match (visible)' : 'text match (scrolled into view)',
+                  wasScrolled: needsScroll
+                };
+              }
+              return { 
+                success: false, 
+                error: 'Radio button not found',
+                availableRadios: allRadios.length
+              };
+            })()
+          `;
+          
+          const result = await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: radioCode, returnByValue: true }
+          );
+          
+          if (!result.result?.value?.success) {
+            const errorMsg = `Failed to select radio button: ${action.element}. ${result.result?.value?.error || 'Radio button not found'}`;
+            console.error(`[performAutomatedInteractions] ${errorMsg}`);
+            await chrome.debugger.detach({ tabId });
+            throw new Error(errorMsg);
+          } else {
+            console.log(`[performAutomatedInteractions] Successfully selected radio button`);
+            if (result.result?.value?.wasScrolled) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+          }
+          
+        } else if (action.type === 'scroll') {
+          const scrollCode = `
+            (function() {
+              window.scrollBy(0, window.innerHeight * 0.8);
+              return { success: true };
+            })()
+          `;
+          
+          await chrome.debugger.sendCommand(
+            { tabId },
+            "Runtime.evaluate",
+            { expression: scrollCode, returnByValue: true }
+          );
+          
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          console.log(`[performAutomatedInteractions] Scrolled page`);
+          
+        } else {
+          console.warn(`[performAutomatedInteractions] Unknown action type: ${action.type}, skipping`);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, actionDelay));
+      } catch (error) {
+        console.error(`[performAutomatedInteractions] Error performing action ${i + 1}:`, error);
+        console.error(`[performAutomatedInteractions] Action details:`, action);
+        try {
+          await chrome.debugger.detach({ tabId });
+        } catch (e) {
+          console.warn('[performAutomatedInteractions] Error detaching debugger:', e);
+        }
+        throw error;
+      }
+    }
+    
+    await chrome.debugger.detach({ tabId });
+    console.log('[performAutomatedInteractions] All interactions completed');
+  } catch (error) {
+    try {
+      await chrome.debugger.detach({ tabId });
+    } catch (e) {}
+    console.error('[performAutomatedInteractions] Error:', error);
+    throw error;
+  }
+}
+
+async function performAutomatedInteractionsWithRecording(tabId, actions, videoDuration) {
+  const recordedFrames = [];
+  let recordingActive = false;
+  let frameCaptureInterval = null;
+  
+  const startRecording = async () => {
+    try {
+      await chrome.tabs.update(tabId, { active: true });
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      const streamId = await new Promise((resolve, reject) => {
+        chrome.tabCapture.capture({
+          audio: false,
+          video: true
+        }, (streamId) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[performAutomatedInteractionsWithRecording] tabCapture failed:', chrome.runtime.lastError.message);
+            reject(new Error(chrome.runtime.lastError.message));
+          } else if (!streamId) {
+            reject(new Error('Failed to get stream ID from tabCapture'));
+          } else {
+            resolve(streamId);
+          }
+        });
+      });
+      
+      console.log('[performAutomatedInteractionsWithRecording] Started recording, stream ID:', streamId);
+      recordingActive = true;
+      
+      const frameInterval = Math.max(0.3, videoDuration / 30);
+      let currentTime = 0;
+      const maxFrames = 30;
+      
+      const captureFrame = async () => {
+        if (!recordingActive || recordedFrames.length >= maxFrames) {
+          return;
+        }
+        
+        try {
+          const screenshot = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+          recordedFrames.push({
+            time: currentTime,
+            image: screenshot,
+            timestamp: currentTime
+          });
+          currentTime += frameInterval;
+          
+          if (currentTime < videoDuration && recordedFrames.length < maxFrames) {
+            frameCaptureInterval = setTimeout(captureFrame, frameInterval * 1000);
+          }
+        } catch (error) {
+          console.warn('[performAutomatedInteractionsWithRecording] Error capturing frame:', error);
+        }
+      };
+      
+      setTimeout(captureFrame, 500);
+    } catch (error) {
+      console.warn('[performAutomatedInteractionsWithRecording] Failed to start video recording, will use screenshots:', error);
+      recordingActive = false;
+    }
+  };
+  
+  const stopRecording = () => {
+    recordingActive = false;
+    if (frameCaptureInterval) {
+      clearTimeout(frameCaptureInterval);
+      frameCaptureInterval = null;
+    }
+    console.log('[performAutomatedInteractionsWithRecording] Stopped recording, captured', recordedFrames.length, 'frames');
+  };
+  
+  try {
+    await startRecording();
+    await performAutomatedInteractions(tabId, actions, videoDuration);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    stopRecording();
+    
+    if (recordedFrames.length === 0) {
+      console.warn('[performAutomatedInteractionsWithRecording] No frames recorded, capturing final screenshot');
+      const snapshot = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+      recordedFrames.push({
+        time: 0,
+        image: snapshot,
+        timestamp: 0
+      });
+    }
+    
+    return recordedFrames;
+  } catch (error) {
+    stopRecording();
+    throw error;
+  }
+}
+
+async function recordVideoFromTab(tabId, duration) {
+  try {
+    console.log('[recordVideoFromTab] Starting video recording for', duration, 'seconds');
+    
+    await chrome.tabs.update(tabId, { active: true });
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    const streamId = await new Promise((resolve, reject) => {
+      chrome.tabCapture.capture({
+        audio: false,
+        video: true
+      }, (streamId) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (!streamId) {
+          reject(new Error('Failed to get stream ID from tabCapture'));
+        } else {
+          resolve(streamId);
+        }
+      });
+    });
+    
+    console.log('[recordVideoFromTab] Got stream ID:', streamId);
+    
+    return new Promise((resolve, reject) => {
+      const frames = [];
+      const frameInterval = Math.max(0.5, duration / 25);
+      let currentTime = 0;
+      let captureCount = 0;
+      const maxFrames = 25;
+      
+      const captureFrame = async () => {
+        try {
+          const screenshot = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+          frames.push({
+            time: currentTime,
+            image: screenshot,
+            timestamp: currentTime
+          });
+          captureCount++;
+          currentTime += frameInterval;
+          
+          if (currentTime >= duration || captureCount >= maxFrames) {
+            console.log('[recordVideoFromTab] Recording complete:', frames.length, 'frames captured');
+            resolve(frames);
+          } else {
+            setTimeout(captureFrame, frameInterval * 1000);
+          }
+        } catch (error) {
+          console.error('[recordVideoFromTab] Error capturing frame:', error);
+          if (frames.length > 0) {
+            console.log('[recordVideoFromTab] Returning', frames.length, 'captured frames despite error');
+            resolve(frames);
+          } else {
+            reject(error);
+          }
+        }
+      };
+      
+      setTimeout(captureFrame, 1000);
+      
+      setTimeout(() => {
+        if (frames.length === 0) {
+          reject(new Error('No frames captured during recording'));
+        }
+      }, duration * 1000 + 5000);
+    });
+  } catch (error) {
+    console.error('[recordVideoFromTab] Error:', error);
+    throw error;
+  }
+}
+
+async function compareVideos(recordedFrames, originalFrames) {
+  try {
+    console.log('[compareVideos] Comparing videos - recorded:', recordedFrames.length, 'original:', originalFrames.length);
+    updateStatus('Comparing recorded video with original...');
+    
+    const response = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Timeout waiting for video comparison response (180s)'));
+      }, 180000);
+      
+      chrome.runtime.sendMessage({
+        action: 'analyzeVideoSimilarity',
+        recordedVideoFrames: recordedFrames,
+        originalVideoFrames: originalFrames,
+        apiKey: GEMINI_API_KEY
+      }, (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+    
+    if (response.error) {
+      throw new Error(response.error);
+    }
+    
+    return {
+      similarity: response.similarity || 0.5,
+      feedback: response.feedback || [],
+      summary: response.summary || 'Video comparison completed'
+    };
+  } catch (error) {
+    console.error('[compareVideos] Error:', error);
+    throw error;
+  }
 }
 
 async function compareWithVideo(snapshot, videoFrames) {

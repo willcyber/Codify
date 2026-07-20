@@ -17,6 +17,176 @@ try {
   console.error('Make sure config.js exists and is in the extension root directory.');
 }
 
+async function extractActionsFromVideo(frames, apiKey, code) {
+  try {
+    console.log('[extractActionsFromVideo] Starting action extraction from', frames.length, 'frames');
+    
+    const prompt = `You are analyzing a website demo.
+
+You are given:
+- A sequence of video frames showing the user interacting with the website
+- The EXACT website code (HTML/CSS/JS) that was generated to reproduce this site:
+
+=== GENERATED WEBSITE CODE START ===
+${code || '(code not available)'}
+=== GENERATED WEBSITE CODE END ===
+
+Use BOTH the video and the code together:
+- The video shows what the user actually does
+- The code tells you the precise element structure, IDs, names, and dropdown <option> values
+
+CRITICAL FOR DROPDOWNS / SELECT MENUS:
+- When the user selects an option from a dropdown, you MUST set the action.value to EXACTLY match one of the <option> texts or values in the generated HTML.
+- If the video text is slightly cropped or unclear, use the code to disambiguate:
+  - Look at the <select> element and its <option> children in the HTML
+  - Choose the option whose text/value best matches what you see in the video
+  - Use the exact option text (preferred) or the exact option value string from the HTML
+- Do NOT invent arbitrary strings that are not present in the <option> list.
+- The goal is that action.value can be matched reliably to a real <option> in the generated code.
+
+Now, analyze these video frames from a website demonstration video. Extract ALL user interactions in chronological order, including every type of interaction.
+
+TASK: Identify EVERY interaction the user performs:
+1. CLICKS: Buttons, links, or any clickable elements - identify by EXACT visible text
+2. TYPING: Text input into any input field - identify by placeholder/label and provide exact text typed
+3. DROPDOWN/SELECT: Selecting an option from a dropdown/select menu - identify the dropdown and the selected option text
+4. CHECKBOX: Checking or unchecking checkboxes - identify by label text
+5. RADIO: Selecting radio buttons - identify by label text
+6. NAVIGATION: Page navigation - identify by link/button text
+7. SCROLLING: Any scrolling actions (if significant)
+8. OTHER: Any other interactions (sliders, date pickers, etc.)
+
+CRITICAL: For element identification, use the EXACT visible text you see in the video, and cross-check with the provided code when helpful:
+- For buttons: Exact button text (e.g., "Submit", "Login", "Go")
+- For inputs: Placeholder or label text (e.g., "Enter email", "Password", "Search")
+- For dropdowns: Label text or visible selected value (e.g., "Country", "Language", "Select option")
+- For checkboxes/radios: Label text next to the element
+- For links: Exact link text (e.g., "Home", "About", "Contact")
+- Be specific and descriptive
+
+For each action, provide:
+- type: "click" | "type" | "select" | "checkbox" | "radio" | "navigate" | "scroll" | "other"
+- element: EXACT visible text or clear description of the element
+- value: 
+  * For typing: the exact text typed
+  * For select/dropdown: the option text that was selected
+  * For checkbox: "check" or "uncheck"
+  * For radio: the option text selected
+  * For other types: relevant value or null
+- timing: Approximate sequence number (1, 2, 3, etc.)
+- selector: (OPTIONAL) If you can identify a CSS selector or specific way to find this element, provide it
+
+OUTPUT FORMAT (JSON only):
+{
+  "actions": [
+    {
+      "type": "click",
+      "element": "Submit button",
+      "value": null,
+      "timing": 1,
+      "selector": null
+    },
+    {
+      "type": "type",
+      "element": "Email input field",
+      "value": "user@example.com",
+      "timing": 2,
+      "selector": null
+    },
+    {
+      "type": "select",
+      "element": "Country dropdown",
+      "value": "United States",
+      "timing": 3,
+      "selector": null
+    },
+    {
+      "type": "checkbox",
+      "element": "Accept terms",
+      "value": "check",
+      "timing": 4,
+      "selector": null
+    },
+    {
+      "type": "radio",
+      "element": "Payment method",
+      "value": "Credit Card",
+      "timing": 5,
+      "selector": null
+    },
+    {
+      "type": "navigate",
+      "element": "Home link",
+      "value": null,
+      "timing": 6,
+      "selector": null
+    }
+  ],
+  "videoDuration": 30
+}
+
+CRITICAL RULES:
+- Only extract actions you can clearly see in the video frames
+- Match element descriptions by visible text
+- For typing, extract the exact text visible in the input field
+- For dropdowns/selects:
+  * Identify both the dropdown element and the selected option text
+  * Cross-check against the provided website code to ensure action.value matches a REAL <option> text or value
+  * If multiple options are similar, prefer the one whose text most closely matches what you see in the video
+- For checkboxes/radios, identify by the label text next to them
+- Maintain chronological order
+- Be comprehensive - include ALL interactions, not just clicks and typing
+- Output ONLY valid JSON, no markdown, no explanations`;
+
+    const imageParts = frames.map(frame => {
+      const frameData = frame.image.includes(',') ? frame.image.split(',')[1] : frame.image;
+      return {
+        inline_data: {
+          mime_type: frame.image.startsWith('data:image/jpeg') ? "image/jpeg" : "image/png",
+          data: frameData
+        }
+      };
+    });
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+    
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            ...imageParts
+          ]
+        }]
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error?.message || 'Failed to extract actions');
+    }
+
+    const data = await response.json();
+    const generatedText = data.candidates[0].content.parts[0].text;
+    
+    let cleanedText = generatedText.trim();
+    if (cleanedText.includes('```json')) {
+      cleanedText = cleanedText.match(/```json\s*([\s\S]*?)```/)?.[1] || cleanedText;
+    } else if (cleanedText.includes('```')) {
+      cleanedText = cleanedText.replace(/```/g, '').trim();
+    }
+    
+    const actions = JSON.parse(cleanedText);
+    console.log('[extractActionsFromVideo] Extracted', actions.actions?.length || 0, 'actions');
+    return actions;
+  } catch (error) {
+    console.error('[extractActionsFromVideo] Error:', error);
+    throw error;
+  }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getApiKey') {
     sendResponse({ apiKey: GEMINI_API_KEY });
@@ -32,6 +202,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     processVideoWithGemini(request.frames, apiKey, request.iteration, request.previousCode, request.previousScreenshot, request.previousFeedback, request.previousSummary)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ error: error.message }));
+    return true;
+  }
+  
+  if (request.action === 'extractActions') {
+    console.log('[background] Received extractActions request');
+    const apiKey = GEMINI_API_KEY || request.apiKey;
+    extractActionsFromVideo(request.frames, apiKey, request.code)
       .then(result => sendResponse(result))
       .catch(error => sendResponse({ error: error.message }));
     return true;
@@ -76,6 +255,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   
+  if (request.action === 'analyzeVideoSimilarity') {
+    console.log('[background] Received analyzeVideoSimilarity request');
+    const apiKey = GEMINI_API_KEY || request.apiKey;
+    analyzeVideoSimilarityWithGemini(request.recordedVideoFrames, request.originalVideoFrames, apiKey)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ error: error.message, similarity: 0.5, feedback: [error.message], summary: 'Video comparison failed' }));
+    return true;
+  }
+  
   return false;
 });
 
@@ -110,7 +298,7 @@ async function processVideoWithGemini(frames, apiKey, iteration, previousCode, p
       });
     }
     
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent?key=${apiKey}`;
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
     
     const response = await fetch(apiUrl, {
       method: 'POST',
@@ -231,7 +419,7 @@ async function analyzeSimilarityWithGemini(screenshot, videoFrames, apiKey) {
     
     console.log('[analyzeSimilarity] Total image parts:', imageParts.length);
     
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent?key=${apiKey}`;
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
     
     const response = await fetch(apiUrl, {
       method: 'POST',
@@ -277,15 +465,96 @@ async function analyzeSimilarityWithGemini(screenshot, videoFrames, apiKey) {
   }
 }
 
-function buildSimilarityPrompt() {
-  return `You are a web design analysis AI. Compare the generated website screenshot with the original video frames and provide an accurate similarity analysis.
+async function analyzeVideoSimilarityWithGemini(recordedVideoFrames, originalVideoFrames, apiKey) {
+  try {
+    console.log('[analyzeVideoSimilarity] Starting video comparison');
+    console.log('[analyzeVideoSimilarity] Recorded frames:', recordedVideoFrames?.length || 0);
+    console.log('[analyzeVideoSimilarity] Original frames:', originalVideoFrames?.length || 0);
+    
+    const prompt = buildVideoSimilarityPrompt();
+    
+    const imageParts = [];
+    
+    if (recordedVideoFrames && recordedVideoFrames.length > 0) {
+      recordedVideoFrames.forEach((frame, idx) => {
+        if (!frame || !frame.image) return;
+        const frameData = frame.image.includes(',') ? frame.image.split(',')[1] : frame.image;
+        imageParts.push({
+          inline_data: {
+            mime_type: "image/png",
+            data: frameData
+          }
+        });
+      });
+      console.log('[analyzeVideoSimilarity] Added', recordedVideoFrames.length, 'recorded frames');
+    }
+    
+    if (originalVideoFrames && originalVideoFrames.length > 0) {
+      originalVideoFrames.forEach((frame, idx) => {
+        if (!frame || !frame.image) return;
+        const frameData = frame.image.includes(',') ? frame.image.split(',')[1] : frame.image;
+        imageParts.push({
+          inline_data: {
+            mime_type: "image/png",
+            data: frameData
+          }
+        });
+      });
+      console.log('[analyzeVideoSimilarity] Added', originalVideoFrames.length, 'original frames');
+    }
+    
+    if (imageParts.length === 0) {
+      throw new Error('No valid video frames provided for comparison');
+    }
+    
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+    
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            ...imageParts
+          ]
+        }]
+      })
+    });
+    
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error?.message || 'Failed to compare videos');
+    }
+    
+    const data = await response.json();
+    const generatedText = data.candidates[0].content.parts[0].text;
+    
+    console.log('[analyzeVideoSimilarity] Gemini response length:', generatedText.length);
+    
+    const analysis = parseSimilarityAnalysis(generatedText);
+    console.log('[analyzeVideoSimilarity] Parsed analysis:', analysis);
+    
+    return analysis;
+  } catch (error) {
+    console.error('[analyzeVideoSimilarity] Error:', error);
+    throw error;
+  }
+}
+
+function buildVideoSimilarityPrompt() {
+  return `You are a web design analysis AI. Compare the recorded video of the generated website with the original video and provide an accurate similarity analysis.
 
 CRITICAL: ONLY report ACTUAL differences you can see. DO NOT hallucinate or make up issues that don't exist.
 
 TASK:
-1. Compare the generated website screenshot (first image) with the video frames (subsequent images)
-2. Look for REAL, VISIBLE differences between the screenshot and video
-3. Provide a similarity percentage (0-100%) based on actual visual match
+1. Compare the recorded video frames (first set of images) with the original video frames (second set of images)
+2. Look for REAL, VISIBLE differences in:
+   - Visual appearance (colors, fonts, layout, sizing)
+   - Functionality (do interactions work the same way?)
+   - User interactions (are the same actions possible?)
+   - Navigation (do pages navigate correctly?)
+3. Provide a similarity percentage (0-100%) based on actual visual and functional match
 4. List ONLY specific, verifiable differences that need to be changed
 
 ANALYSIS REQUIREMENTS - CHECK THESE CAREFULLY:
@@ -324,20 +593,21 @@ OUTPUT FORMAT (JSON only):
 {
   "similarity": 85.5,
   "feedback": [
-    "Heading font size appears to be 24px in screenshot but 28px in video",
-    "Button width is 120px in screenshot but 150px in video",
-    "Text in input field overflows container in screenshot but fits in video",
-    "Padding around button text is 8px in screenshot but 12px in video"
+    "Heading font size appears to be 24px in recorded video but 28px in original",
+    "Button width is 120px in recorded video but 150px in original",
+    "Text in input field overflows container in recorded video but fits in original",
+    "Navigation to second page works in original but fails in recorded video",
+    "Submit button click works in original but does nothing in recorded video"
   ],
-  "summary": "Overall good match but needs font size and element dimension adjustments"
+  "summary": "Overall good match but needs font size and element dimension adjustments, and navigation functionality needs fixing"
 }
 
 CRITICAL RULES:
-- Only include feedback for differences you can ACTUALLY SEE when comparing screenshot to video
+- Only include feedback for differences you can ACTUALLY SEE when comparing recorded video to original video
 - Be precise: include measurements (px values) when reporting size differences
-- Focus on element sizing and text fitting issues
-- If something matches the video, do NOT include it in feedback
-- Provide similarity as a number between 0 and 100 based on actual visual match
+- Focus on element sizing, text fitting, and functionality issues
+- If something matches the original video, do NOT include it in feedback
+- Provide similarity as a number between 0 and 100 based on actual visual and functional match
 - Output ONLY valid JSON, no markdown, no explanations outside JSON`;
 }
 
@@ -534,9 +804,9 @@ CRITICAL INSTRUCTIONS:
 ${previousScreenshot ? 'A screenshot of the previous attempt is included. Use it to verify what currently exists before making changes.' : ''}
 
 Previous code summary:
-- HTML structure: ${previousCode.html ? previousCode.html.substring(0, 300) + '...' : 'N/A'}
-- CSS styling: ${previousCode.css ? previousCode.css.substring(0, 300) + '...' : 'N/A'}
-- JavaScript: ${previousCode.js ? previousCode.js.substring(0, 300) + '...' : 'N/A'}
+- HTML structure: ${previousCode?.html ? previousCode.html.substring(0, 300) + '...' : 'N/A'}
+- CSS styling: ${previousCode?.css ? previousCode.css.substring(0, 300) + '...' : 'N/A'}
+- JavaScript: ${previousCode?.js ? previousCode.js.substring(0, 300) + '...' : 'N/A'}
 
 REMEMBER: Make minimal changes. Only fix what's in the feedback. Keep everything else identical.` : ''}
 

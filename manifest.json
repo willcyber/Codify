@@ -8,7 +8,9 @@
     "activeTab",
     "storage",
     "scripting",
-    "webNavigation"
+    "webNavigation",
+    "tabCapture",
+    "debugger"
   ],
   "host_permissions": [
     "http://localhost/*",
