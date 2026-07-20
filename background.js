@@ -17,6 +17,55 @@ try {
   console.error('Make sure config.js exists and is in the extension root directory.');
 }
 
+const GEMINI_MODEL = 'gemini-flash-latest';
+const GEMINI_MAX_RETRIES = 3;
+
+// Single entry point for all Gemini calls. Retries transient failures
+// (429/5xx/network errors, e.g. "model experiencing high demand") with
+// exponential backoff: 2s, 4s, 8s. Non-transient errors (bad key, bad
+// request) throw immediately.
+async function callGemini(apiKey, parts, { label = 'gemini' } = {}) {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  let lastError;
+  for (let attempt = 0; attempt <= GEMINI_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const delayMs = 2000 * Math.pow(2, attempt - 1);
+      console.warn(`[${label}] Retry ${attempt}/${GEMINI_MAX_RETRIES} in ${delayMs}ms after: ${lastError.message}`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+
+    let response;
+    try {
+      response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts }] })
+      });
+    } catch (e) {
+      lastError = new Error(`Network error calling Gemini: ${e.message}`);
+      continue;
+    }
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      lastError = new Error(error.error?.message || `Gemini API error (HTTP ${response.status})`);
+      if ([429, 500, 502, 503, 504].includes(response.status)) {
+        continue;
+      }
+      throw lastError;
+    }
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      lastError = new Error('Invalid or empty response from Gemini API');
+      continue;
+    }
+    return text;
+  }
+  throw lastError;
+}
+
 async function extractActionsFromVideo(frames, apiKey, code) {
   try {
     console.log('[extractActionsFromVideo] Starting action extraction from', frames.length, 'frames');
@@ -148,29 +197,8 @@ CRITICAL RULES:
       };
     });
 
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-    
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            ...imageParts
-          ]
-        }]
-      })
-    });
+    const generatedText = await callGemini(apiKey, [{ text: prompt }, ...imageParts], { label: 'extractActions' });
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error?.message || 'Failed to extract actions');
-    }
-
-    const data = await response.json();
-    const generatedText = data.candidates[0].content.parts[0].text;
-    
     let cleanedText = generatedText.trim();
     if (cleanedText.includes('```json')) {
       cleanedText = cleanedText.match(/```json\s*([\s\S]*?)```/)?.[1] || cleanedText;
@@ -298,37 +326,8 @@ async function processVideoWithGemini(frames, apiKey, iteration, previousCode, p
       });
     }
     
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-    
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            ...imageParts
-          ]
-        }]
-      })
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      const errorMsg = error.error?.message || 'Failed to call Gemini API';
-      throw new Error(errorMsg);
-    }
-    
-    const data = await response.json();
-    
-    if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
-      throw new Error('Invalid response from Gemini API');
-    }
-    
-    const generatedText = data.candidates[0].content.parts[0].text;
-    
+    const generatedText = await callGemini(apiKey, [{ text: prompt }, ...imageParts], { label: 'processVideo' });
+
     console.log('=== GEMINI RAW OUTPUT ===');
     console.log('Full response length:', generatedText.length);
     console.log('First 1000 characters:', generatedText.substring(0, 1000));
@@ -419,37 +418,8 @@ async function analyzeSimilarityWithGemini(screenshot, videoFrames, apiKey) {
     
     console.log('[analyzeSimilarity] Total image parts:', imageParts.length);
     
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-    
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            ...imageParts
-          ]
-        }]
-      })
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      const errorMsg = error.error?.message || 'Failed to call Gemini API';
-      throw new Error(errorMsg);
-    }
-    
-    const data = await response.json();
-    
-    if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
-      throw new Error('Invalid response from Gemini API');
-    }
-    
-    const generatedText = data.candidates[0].content.parts[0].text;
-    
+    const generatedText = await callGemini(apiKey, [{ text: prompt }, ...imageParts], { label: 'analyzeSimilarity' });
+
     console.log('[analyzeSimilarity] Gemini response length:', generatedText.length);
     console.log('[analyzeSimilarity] Gemini response preview:', generatedText.substring(0, 500));
     
@@ -507,29 +477,8 @@ async function analyzeVideoSimilarityWithGemini(recordedVideoFrames, originalVid
       throw new Error('No valid video frames provided for comparison');
     }
     
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-    
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            ...imageParts
-          ]
-        }]
-      })
-    });
-    
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error?.message || 'Failed to compare videos');
-    }
-    
-    const data = await response.json();
-    const generatedText = data.candidates[0].content.parts[0].text;
-    
+    const generatedText = await callGemini(apiKey, [{ text: prompt }, ...imageParts], { label: 'analyzeVideoSimilarity' });
+
     console.log('[analyzeVideoSimilarity] Gemini response length:', generatedText.length);
     
     const analysis = parseSimilarityAnalysis(generatedText);
